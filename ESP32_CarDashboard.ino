@@ -1,670 +1,528 @@
 /**
- * ESP32-S3 WiFi CSI Vital Signs Radar
- * Non-contact Heart Rate & Breathing Detection
- * 7" Waveshare Touch LCD Display
+ * Tesla-Style Dashboard with Touch Controls
+ * ESP32-S3 7" Waveshare Touch LCD
+ * Inspired by VelocityDRIVE CT & Tesla Model S/3
  */
 
 #include <Arduino.h>
 #include <esp_display_panel.hpp>
 #include <lvgl.h>
 #include "lvgl_v8_port.h"
-#include <WiFi.h>
-#include <esp_wifi.h>
-#include <esp_wifi_types.h>
-#include <math.h>
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
 
 Board *board = NULL;
 
-// UI Objects
+// UI Objects - Main Dashboard
 static lv_obj_t *scr;
-static lv_obj_t *heart_rate_label;
-static lv_obj_t *breathing_rate_label;
-static lv_obj_t *heart_chart;
-static lv_obj_t *breathing_chart;
-static lv_obj_t *radar_canvas;
-static lv_obj_t *status_label;
-static lv_obj_t *distance_label;
-static lv_obj_t *signal_meter;
-static lv_obj_t *heart_icon;
-static lv_obj_t *breath_icon;
-static lv_chart_series_t *heart_series;
-static lv_chart_series_t *breathing_series;
-static lv_timer_t *radar_timer;
-static lv_timer_t *update_timer;
+static lv_obj_t *speed_gauge;
+static lv_obj_t *speed_label;
+static lv_obj_t *speed_unit_label;
+static lv_obj_t *power_meter;
+static lv_obj_t *battery_container;
+static lv_obj_t *battery_bar;
+static lv_obj_t *battery_label;
+static lv_obj_t *range_label;
+static lv_obj_t *gear_selector;
+static lv_obj_t *drive_mode_label;
+
+// Touch Control Panels
+static lv_obj_t *left_panel;
+static lv_obj_t *center_panel;
+static lv_obj_t *right_panel;
+static lv_obj_t *bottom_panel;
 
 // Touch Controls
-static lv_obj_t *sensitivity_slider;
-static lv_obj_t *sensitivity_label;
-static lv_obj_t *mode_btn_group;
-static lv_obj_t *mode_label;
-static lv_obj_t *settings_panel;
-static lv_obj_t *calibrate_btn;
-static lv_obj_t *baseline_btn;
-static lv_obj_t *noise_filter_switch;
+static lv_obj_t *climate_btn;
+static lv_obj_t *media_btn;
+static lv_obj_t *nav_btn;
+static lv_obj_t *phone_btn;
+static lv_obj_t *settings_btn;
+static lv_obj_t *autopilot_btn;
+static lv_obj_t *park_btn;
+static lv_obj_t *reverse_btn;
+static lv_obj_t *neutral_btn;
+static lv_obj_t *drive_btn;
+static lv_obj_t *temp_slider;
+static lv_obj_t *volume_slider;
+static lv_obj_t *brightness_slider;
 
-// CSI Configuration
-#define CSI_BUFFER_SIZE 512
-#define FFT_SIZE 256
-#define RADAR_RADIUS 100
+// Status Indicators
+static lv_obj_t *left_turn_signal;
+static lv_obj_t *right_turn_signal;
+static lv_obj_t *headlight_indicator;
+static lv_obj_t *parking_brake_indicator;
+static lv_obj_t *door_status[4];
+static lv_obj_t *tire_pressure[4];
+static lv_obj_t *temp_label;
+static lv_obj_t *time_label;
 
-// CSI Data
-static float csi_amplitude[CSI_BUFFER_SIZE];
-static float csi_phase[CSI_BUFFER_SIZE];
-static int csi_index = 0;
-static float heart_rate = 72.0;
-static float breathing_rate = 16.0;
-static float signal_quality = 0.0;
-static int detection_distance = 0;
-static bool person_detected = false;
+// Charts and Visualizations
+static lv_obj_t *power_chart;
+static lv_obj_t *efficiency_chart;
+static lv_obj_t *nav_map;
+static lv_chart_series_t *power_series;
+static lv_chart_series_t *regen_series;
+static lv_chart_series_t *efficiency_series;
 
-// Sensitivity & Detection Parameters
-static float sensitivity = 50.0;  // 0-100 scale
-static float detection_threshold = 20.0;
-static float noise_floor = 5.0;
-static bool noise_filter_enabled = true;
-static bool auto_calibrate = true;
-static int detection_mode = 0; // 0: Normal, 1: High Precision, 2: Long Range
-static float baseline_amplitude = 0;
-static float amplitude_gain = 1.0;
+// Animation timers
+static lv_timer_t *update_timer;
+static lv_timer_t *animation_timer;
 
-// Radar animation
-static float radar_angle = 0;
-static uint8_t radar_points[360];
+// Vehicle State
+typedef struct {
+    int speed;
+    int target_speed;
+    int power;
+    int battery_percent;
+    int range_km;
+    char gear; // P, R, N, D
+    bool autopilot_enabled;
+    bool left_signal;
+    bool right_signal;
+    int temp_inside;
+    int temp_outside;
+    bool doors_locked;
+    bool lights_on;
+    float tire_pressure_psi[4];
+    int volume;
+    int brightness;
+    int climate_temp;
+} VehicleState;
 
-// Color scheme
-static lv_color_t color_red = LV_COLOR_MAKE(0xFF, 0x00, 0x00);
-static lv_color_t color_green = LV_COLOR_MAKE(0x00, 0xFF, 0x00);
-static lv_color_t color_blue = LV_COLOR_MAKE(0x00, 0xAA, 0xFF);
-static lv_color_t color_cyan = LV_COLOR_MAKE(0x00, 0xFF, 0xFF);
+static VehicleState vehicle = {
+    .speed = 0,
+    .target_speed = 0,
+    .power = 0,
+    .battery_percent = 85,
+    .range_km = 380,
+    .gear = 'P',
+    .autopilot_enabled = false,
+    .left_signal = false,
+    .right_signal = false,
+    .temp_inside = 22,
+    .temp_outside = 18,
+    .doors_locked = true,
+    .lights_on = false,
+    .tire_pressure_psi = {32.5, 32.5, 32.0, 32.0},
+    .volume = 50,
+    .brightness = 70,
+    .climate_temp = 22
+};
+
+// Color scheme - Tesla inspired
+static lv_color_t color_tesla_red = LV_COLOR_MAKE(0xE3, 0x1C, 0x1C);
+static lv_color_t color_tesla_blue = LV_COLOR_MAKE(0x3D, 0x6C, 0xCE);
+static lv_color_t color_white = LV_COLOR_MAKE(0xFF, 0xFF, 0xFF);
+static lv_color_t color_gray = LV_COLOR_MAKE(0x4A, 0x4A, 0x4A);
 static lv_color_t color_dark = LV_COLOR_MAKE(0x1A, 0x1A, 0x1A);
-
-// Simple FFT for heart rate detection
-void simple_fft(float* input, float* output, int n) {
-    // Basic frequency analysis for heart rate (0.8-3 Hz) and breathing (0.1-0.5 Hz)
-    for (int k = 0; k < n/2; k++) {
-        float real = 0, imag = 0;
-        for (int t = 0; t < n; t++) {
-            float angle = -2.0 * PI * k * t / n;
-            real += input[t] * cos(angle);
-            imag += input[t] * sin(angle);
-        }
-        output[k] = sqrt(real * real + imag * imag);
-    }
-}
-
-// Extract vital signs from CSI data
-void extract_vital_signs() {
-    static float fft_output[FFT_SIZE/2];
-    static float filtered_hr = 72.0;
-    static float filtered_br = 16.0;
-
-    // Prepare data for FFT
-    float input_data[FFT_SIZE];
-    for (int i = 0; i < FFT_SIZE; i++) {
-        int idx = (csi_index - FFT_SIZE + i + CSI_BUFFER_SIZE) % CSI_BUFFER_SIZE;
-        input_data[i] = csi_amplitude[idx];
-    }
-
-    // Perform simple FFT
-    simple_fft(input_data, fft_output, FFT_SIZE);
-
-    // Find heart rate peak (0.8-3 Hz range, assuming 10 Hz sampling)
-    float max_hr_power = 0;
-    int hr_peak_idx = 0;
-    for (int i = 8; i < 30; i++) {  // 0.8-3 Hz at 10 Hz sampling
-        if (fft_output[i] > max_hr_power) {
-            max_hr_power = fft_output[i];
-            hr_peak_idx = i;
-        }
-    }
-
-    // Find breathing rate peak (0.1-0.5 Hz range)
-    float max_br_power = 0;
-    int br_peak_idx = 0;
-    for (int i = 1; i < 5; i++) {  // 0.1-0.5 Hz at 10 Hz sampling
-        if (fft_output[i] > max_br_power) {
-            max_br_power = fft_output[i];
-            br_peak_idx = i;
-        }
-    }
-
-    // Convert to BPM
-    float detected_hr = (hr_peak_idx * 10.0 / FFT_SIZE) * 60.0;
-    float detected_br = (br_peak_idx * 10.0 / FFT_SIZE) * 60.0;
-
-    // Apply smoothing filter
-    filtered_hr = filtered_hr * 0.8 + detected_hr * 0.2;
-    filtered_br = filtered_br * 0.9 + detected_br * 0.1;
-
-    // Clamp to realistic ranges
-    heart_rate = constrain(filtered_hr, 40, 180);
-    breathing_rate = constrain(filtered_br, 8, 30);
-
-    // Calculate signal quality
-    signal_quality = min(100.0f, (max_hr_power / 1000.0f) * 100.0f);
-}
-
-// WiFi CSI callback with enhanced sensitivity
-void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info) {
-    if (info->rx_ctrl.sig_mode == 1) {  // HT mode
-        int8_t *data = (int8_t *)info->buf;
-
-        float amplitude = 0;
-        float phase = 0;
-
-        // Process CSI data with enhanced precision
-        for (int i = 0; i < info->len; i += 2) {
-            float real = data[i];
-            float imag = data[i + 1];
-            amplitude += sqrt(real * real + imag * imag);
-            phase += atan2(imag, real);
-        }
-
-        amplitude /= (info->len / 2);
-        phase /= (info->len / 2);
-
-        // Apply sensitivity gain
-        amplitude_gain = 1.0 + (sensitivity / 100.0) * 4.0;  // 1x to 5x gain
-        amplitude *= amplitude_gain;
-
-        // Noise filtering
-        if (noise_filter_enabled && amplitude < noise_floor) {
-            amplitude = 0;
-        }
-
-        // Auto-calibration for baseline
-        if (auto_calibrate && csi_index < 100) {
-            baseline_amplitude = (baseline_amplitude * 0.95) + (amplitude * 0.05);
-        }
-
-        // Store in buffer
-        csi_amplitude[csi_index] = amplitude - baseline_amplitude;
-        csi_phase[csi_index] = phase;
-        csi_index = (csi_index + 1) % CSI_BUFFER_SIZE;
-
-        // Enhanced detection based on mode
-        float adaptive_threshold = detection_threshold * (100 - sensitivity) / 100.0;
-
-        switch(detection_mode) {
-            case 0: // Normal mode
-                person_detected = (amplitude - baseline_amplitude) > adaptive_threshold;
-                break;
-            case 1: // High precision mode
-                person_detected = (amplitude - baseline_amplitude) > (adaptive_threshold * 0.5);
-                break;
-            case 2: // Long range mode
-                person_detected = (amplitude - baseline_amplitude) > (adaptive_threshold * 2.0);
-                break;
-        }
-
-        detection_distance = constrain(100 - (amplitude - baseline_amplitude), 0, 100);
-    }
-}
-
-// Initialize WiFi CSI
-void setup_wifi_csi() {
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-
-    wifi_csi_config_t csi_config = {
-        .lltf_en = true,
-        .htltf_en = true,
-        .stbc_htltf2_en = true,
-        .ltf_merge_en = true,
-        .channel_filter_en = false,
-        .manu_scale = false,
-        .shift = 0,
-    };
-
-    esp_wifi_set_csi_config(&csi_config);
-    esp_wifi_set_csi_rx_cb(&wifi_csi_rx_cb, NULL);
-    esp_wifi_set_csi(true);
-
-    // Start scanning
-    WiFi.scanNetworks(true, false, false, 300, 6);
-}
+static lv_color_t color_green = LV_COLOR_MAKE(0x4A, 0xD3, 0x4A);
+static lv_color_t color_orange = LV_COLOR_MAKE(0xFF, 0xA5, 0x00);
 
 // Touch event handlers
-static void sensitivity_slider_event_cb(lv_event_t *e) {
+static void gear_select_event_cb(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_target(e);
+    const char *txt = lv_label_get_text(lv_obj_get_child(btn, 0));
+    vehicle.gear = txt[0];
+
+    // Update visual feedback
+    lv_obj_set_style_bg_color(park_btn, vehicle.gear == 'P' ? color_tesla_blue : color_gray, 0);
+    lv_obj_set_style_bg_color(reverse_btn, vehicle.gear == 'R' ? color_tesla_blue : color_gray, 0);
+    lv_obj_set_style_bg_color(neutral_btn, vehicle.gear == 'N' ? color_tesla_blue : color_gray, 0);
+    lv_obj_set_style_bg_color(drive_btn, vehicle.gear == 'D' ? color_tesla_blue : color_gray, 0);
+
+    lv_label_set_text_fmt(gear_selector, "%c", vehicle.gear);
+}
+
+static void autopilot_event_cb(lv_event_t *e) {
+    vehicle.autopilot_enabled = !vehicle.autopilot_enabled;
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_obj_set_style_bg_color(btn,
+        vehicle.autopilot_enabled ? color_tesla_blue : color_gray, 0);
+    lv_label_set_text(lv_obj_get_child(btn, 0),
+        vehicle.autopilot_enabled ? "AUTOPILOT ON" : "AUTOPILOT OFF");
+}
+
+static void climate_slider_event_cb(lv_event_t *e) {
     lv_obj_t *slider = lv_event_get_target(e);
-    sensitivity = lv_slider_get_value(slider);
-    lv_label_set_text_fmt(sensitivity_label, "Sensitivity: %d%%", (int)sensitivity);
-
-    // Adjust detection parameters based on sensitivity
-    detection_threshold = 20.0 * (100 - sensitivity) / 100.0 + 5.0;
-    noise_floor = 10.0 * (100 - sensitivity) / 100.0;
+    vehicle.climate_temp = lv_slider_get_value(slider);
+    lv_label_set_text_fmt(temp_label, "%d°C", vehicle.climate_temp);
 }
 
-static void mode_btn_event_cb(lv_event_t *e) {
+static void volume_slider_event_cb(lv_event_t *e) {
+    lv_obj_t *slider = lv_event_get_target(e);
+    vehicle.volume = lv_slider_get_value(slider);
+}
+
+static void brightness_slider_event_cb(lv_event_t *e) {
+    lv_obj_t *slider = lv_event_get_target(e);
+    vehicle.brightness = lv_slider_get_value(slider);
+    // In real implementation, this would control display brightness
+}
+
+static void turn_signal_event_cb(lv_event_t *e) {
     lv_obj_t *btn = lv_event_get_target(e);
-    uint32_t id = lv_btnmatrix_get_selected_btn(btn);
-    detection_mode = id;
-
-    const char *mode_names[] = {"Normal", "High Precision", "Long Range"};
-    lv_label_set_text_fmt(mode_label, "Mode: %s", mode_names[detection_mode]);
-}
-
-static void calibrate_btn_event_cb(lv_event_t *e) {
-    baseline_amplitude = 0;
-    auto_calibrate = true;
-    csi_index = 0;
-    lv_obj_t *btn = lv_event_get_target(e);
-    lv_label_set_text(lv_obj_get_child(btn, 0), "Calibrating...");
-    lv_timer_handler();
-    delay(100);
-    lv_label_set_text(lv_obj_get_child(btn, 0), "Calibrate");
-}
-
-static void baseline_btn_event_cb(lv_event_t *e) {
-    // Reset baseline
-    baseline_amplitude = 0;
-    for (int i = 0; i < CSI_BUFFER_SIZE; i++) {
-        csi_amplitude[i] = 0;
+    if (btn == left_turn_signal) {
+        vehicle.left_signal = !vehicle.left_signal;
+        vehicle.right_signal = false;
+    } else {
+        vehicle.right_signal = !vehicle.right_signal;
+        vehicle.left_signal = false;
     }
 }
 
-static void noise_filter_switch_event_cb(lv_event_t *e) {
-    lv_obj_t *sw = lv_event_get_target(e);
-    noise_filter_enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
-}
-
-// Draw radar sweep
-void draw_radar(lv_timer_t *timer) {
-    static lv_color_t buf[RADAR_RADIUS * RADAR_RADIUS * 4];
-    lv_canvas_set_buffer(radar_canvas, buf, RADAR_RADIUS * 2, RADAR_RADIUS * 2, LV_IMG_CF_TRUE_COLOR);
-
-    // Clear canvas
-    lv_canvas_fill_bg(radar_canvas, lv_color_black(), LV_OPA_COVER);
-
-    // Draw radar circles
-    lv_draw_arc_dsc_t arc_dsc;
-    lv_draw_arc_dsc_init(&arc_dsc);
-    arc_dsc.color = color_green;
-    arc_dsc.width = 1;
-
-    for (int r = 40; r <= RADAR_RADIUS; r += 40) {
-        lv_canvas_draw_arc(radar_canvas, RADAR_RADIUS, RADAR_RADIUS, r, 0, 360, &arc_dsc);
-    }
-
-    // Draw cross lines
-    lv_draw_line_dsc_t line_dsc;
-    lv_draw_line_dsc_init(&line_dsc);
-    line_dsc.color = color_green;
-    line_dsc.width = 1;
-
-    lv_point_t line_points[2];
-
-    // Horizontal line
-    line_points[0].x = 0;
-    line_points[0].y = RADAR_RADIUS;
-    line_points[1].x = RADAR_RADIUS * 2;
-    line_points[1].y = RADAR_RADIUS;
-    lv_canvas_draw_line(radar_canvas, line_points, 2, &line_dsc);
-
-    // Vertical line
-    line_points[0].x = RADAR_RADIUS;
-    line_points[0].y = 0;
-    line_points[1].x = RADAR_RADIUS;
-    line_points[1].y = RADAR_RADIUS * 2;
-    lv_canvas_draw_line(radar_canvas, line_points, 2, &line_dsc);
-
-    // Draw sweep line
-    radar_angle += 3;
-    if (radar_angle >= 360) radar_angle = 0;
-
-    float rad = radar_angle * PI / 180.0;
-    int x = RADAR_RADIUS + cos(rad) * RADAR_RADIUS;
-    int y = RADAR_RADIUS - sin(rad) * RADAR_RADIUS;
-
-    line_dsc.color = color_cyan;
-    line_dsc.width = 2;
-    line_points[0].x = RADAR_RADIUS;
-    line_points[0].y = RADAR_RADIUS;
-    line_points[1].x = x;
-    line_points[1].y = y;
-    lv_canvas_draw_line(radar_canvas, line_points, 2, &line_dsc);
-
-    // Draw detected points
-    if (person_detected) {
-        lv_draw_rect_dsc_t rect_dsc;
-        lv_draw_rect_dsc_init(&rect_dsc);
-        rect_dsc.bg_color = color_red;
-        rect_dsc.radius = 3;
-
-        int px = RADAR_RADIUS + cos(rad) * (RADAR_RADIUS - detection_distance);
-        int py = RADAR_RADIUS - sin(rad) * (RADAR_RADIUS - detection_distance);
-
-        lv_area_t area;
-        area.x1 = px - 3;
-        area.y1 = py - 3;
-        area.x2 = px + 3;
-        area.y2 = py + 3;
-        lv_canvas_draw_rect(radar_canvas, area.x1, area.y1, 6, 6, &rect_dsc);
-
-        // Store point for persistence
-        radar_points[(int)radar_angle] = 255;
-    }
-
-    // Draw persistent points with fade
-    lv_draw_rect_dsc_t fade_rect_dsc;
-    lv_draw_rect_dsc_init(&fade_rect_dsc);
-    fade_rect_dsc.radius = 2;
-    for (int i = 0; i < 360; i++) {
-        if (radar_points[i] > 0) {
-            float a = i * PI / 180.0;
-            int px = RADAR_RADIUS + cos(a) * (RADAR_RADIUS - detection_distance);
-            int py = RADAR_RADIUS - sin(a) * (RADAR_RADIUS - detection_distance);
-
-            fade_rect_dsc.bg_opa = radar_points[i];
-            fade_rect_dsc.bg_color = lv_color_mix(color_red, lv_color_black(), radar_points[i]);
-
-            lv_area_t area;
-            area.x1 = px - 2;
-            area.y1 = py - 2;
-            area.x2 = px + 2;
-            area.y2 = py + 2;
-            lv_canvas_draw_rect(radar_canvas, area.x1, area.y1, 4, 4, &fade_rect_dsc);
-
-            // Fade out
-            radar_points[i] = max(0, radar_points[i] - 3);
-        }
-    }
-}
-
-// Update vital signs display
-void update_display(lv_timer_t *timer) {
+// Update dashboard display
+static void update_dashboard(lv_timer_t *timer) {
     static int counter = 0;
     counter++;
 
-    // Simulate CSI data for demo
-    float t = millis() / 1000.0;
-    float hr_wave = sin(t * 1.2 * 2 * PI) * 10;  // ~72 BPM
-    float br_wave = sin(t * 0.27 * 2 * PI) * 20;  // ~16 BPM
-    float noise = random(-5, 5) / 10.0;
+    // Simulate speed changes
+    if (vehicle.gear == 'D') {
+        if (vehicle.speed < 120) vehicle.speed += random(0, 5);
+    } else if (vehicle.gear == 'R') {
+        if (vehicle.speed > -20) vehicle.speed -= 1;
+    } else {
+        if (vehicle.speed > 0) vehicle.speed -= 2;
+        if (vehicle.speed < 0) vehicle.speed += 1;
+    }
 
-    csi_amplitude[csi_index] = 50 + hr_wave + br_wave + noise;
-    csi_index = (csi_index + 1) % CSI_BUFFER_SIZE;
+    // Update speed display
+    lv_label_set_text_fmt(speed_label, "%d", abs(vehicle.speed));
 
-    // Extract vital signs every 10 updates
+    // Update power meter (simulate based on speed change)
+    vehicle.power = random(-50, 150);
+    lv_bar_set_value(power_meter, 100 + vehicle.power, LV_ANIM_ON);
+
+    // Update battery (slow drain simulation)
+    if (counter % 100 == 0 && vehicle.battery_percent > 20) {
+        vehicle.battery_percent--;
+        vehicle.range_km = vehicle.battery_percent * 4.5;
+    }
+
+    lv_bar_set_value(battery_bar, vehicle.battery_percent, LV_ANIM_ON);
+    lv_label_set_text_fmt(battery_label, "%d%%", vehicle.battery_percent);
+    lv_label_set_text_fmt(range_label, "%d km", vehicle.range_km);
+
+    // Update charts
+    lv_chart_set_next_value(power_chart, power_series, vehicle.power);
+    lv_chart_set_next_value(power_chart, regen_series, vehicle.power < 0 ? -vehicle.power : 0);
+
+    // Turn signal blinking
     if (counter % 10 == 0) {
-        extract_vital_signs();
-
-        // Update heart rate
-        lv_label_set_text_fmt(heart_rate_label, "%d", (int)heart_rate);
-        lv_chart_set_next_value(heart_chart, heart_series, heart_rate);
-
-        // Update breathing rate
-        lv_label_set_text_fmt(breathing_rate_label, "%d", (int)breathing_rate);
-        lv_chart_set_next_value(breathing_chart, breathing_series, breathing_rate);
-
-        // Update signal quality
-        lv_bar_set_value(signal_meter, (int)signal_quality, LV_ANIM_ON);
-
-        // Update status with sensitivity feedback
-        if (person_detected) {
-            lv_label_set_text(status_label, "Person Detected");
-            lv_obj_set_style_text_color(status_label, color_green, 0);
-            lv_label_set_text_fmt(distance_label, "Distance: %d cm | Gain: %.1fx",
-                50 + detection_distance, amplitude_gain);
+        if (vehicle.left_signal) {
+            static bool blink = false;
+            blink = !blink;
+            lv_obj_set_style_bg_opa(left_turn_signal, blink ? LV_OPA_100 : LV_OPA_30, 0);
         } else {
-            lv_label_set_text(status_label, "Scanning...");
-            lv_obj_set_style_text_color(status_label, color_blue, 0);
-            lv_label_set_text_fmt(distance_label, "Calibrating... | Gain: %.1fx", amplitude_gain);
+            lv_obj_set_style_bg_opa(left_turn_signal, LV_OPA_30, 0);
         }
 
-        // Animate heart icon
-        static bool heart_beat = false;
-        heart_beat = !heart_beat;
-        if (heart_beat && person_detected) {
-            lv_obj_set_style_text_color(heart_icon, color_red, 0);
-            lv_obj_set_style_transform_zoom(heart_icon, 280, 0);
+        if (vehicle.right_signal) {
+            static bool blink = false;
+            blink = !blink;
+            lv_obj_set_style_bg_opa(right_turn_signal, blink ? LV_OPA_100 : LV_OPA_30, 0);
         } else {
-            lv_obj_set_style_text_color(heart_icon, LV_COLOR_MAKE(0x80, 0x00, 0x00), 0);
-            lv_obj_set_style_transform_zoom(heart_icon, 256, 0);
+            lv_obj_set_style_bg_opa(right_turn_signal, LV_OPA_30, 0);
         }
     }
+
+    // Update time
+    unsigned long seconds = millis() / 1000;
+    int hours = (seconds / 3600) % 24;
+    int minutes = (seconds / 60) % 60;
+    lv_label_set_text_fmt(time_label, "%02d:%02d", hours, minutes);
 }
 
-// Create UI
-void create_radar_ui() {
+// Create Tesla-style dashboard UI
+void create_tesla_dashboard() {
     scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(scr, color_dark, 0);
 
-    // Title
-    lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "WiFi CSI Vital Signs Radar - Touch Enabled");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, color_cyan, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 5);
+    // Top status bar
+    lv_obj_t *top_bar = lv_obj_create(scr);
+    lv_obj_set_size(top_bar, 800, 40);
+    lv_obj_align(top_bar, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(top_bar, LV_COLOR_MAKE(0x10, 0x10, 0x10), 0);
+    lv_obj_set_style_border_width(top_bar, 0, 0);
+    lv_obj_clear_flag(top_bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Radar display (left) - optimized for 800x480
-    lv_obj_t *radar_container = lv_obj_create(scr);
-    lv_obj_set_size(radar_container, 220, 220);
-    lv_obj_align(radar_container, LV_ALIGN_LEFT_MID, 10, -10);
-    lv_obj_set_style_bg_color(radar_container, color_dark, 0);
-    lv_obj_set_style_border_color(radar_container, color_green, 0);
-    lv_obj_set_style_border_width(radar_container, 2, 0);
-    lv_obj_clear_flag(radar_container, LV_OBJ_FLAG_SCROLLABLE);
+    // Tesla logo/brand
+    lv_obj_t *brand = lv_label_create(top_bar);
+    lv_label_set_text(brand, "TESLA");
+    lv_obj_set_style_text_font(brand, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(brand, color_tesla_red, 0);
+    lv_obj_align(brand, LV_ALIGN_LEFT_MID, 10, 0);
 
-    radar_canvas = lv_canvas_create(radar_container);
-    lv_obj_set_size(radar_canvas, RADAR_RADIUS * 2, RADAR_RADIUS * 2);
-    lv_obj_center(radar_canvas);
+    // Time display
+    time_label = lv_label_create(top_bar);
+    lv_label_set_text(time_label, "00:00");
+    lv_obj_set_style_text_color(time_label, color_white, 0);
+    lv_obj_align(time_label, LV_ALIGN_CENTER, 0, 0);
 
-    // Heart rate panel (center) - optimized layout
-    lv_obj_t *hr_panel = lv_obj_create(scr);
-    lv_obj_set_size(hr_panel, 200, 160);
-    lv_obj_align(hr_panel, LV_ALIGN_TOP_MID, -20, 35);
-    lv_obj_set_style_bg_color(hr_panel, color_dark, 0);
-    lv_obj_set_style_border_color(hr_panel, color_red, 0);
-    lv_obj_set_style_border_width(hr_panel, 2, 0);
-    lv_obj_clear_flag(hr_panel, LV_OBJ_FLAG_SCROLLABLE);
+    // Temperature
+    temp_label = lv_label_create(top_bar);
+    lv_label_set_text_fmt(temp_label, "%d°C", vehicle.temp_outside);
+    lv_obj_set_style_text_color(temp_label, color_white, 0);
+    lv_obj_align(temp_label, LV_ALIGN_RIGHT_MID, -10, 0);
 
-    heart_icon = lv_label_create(hr_panel);
-    lv_label_set_text(heart_icon, "\xE2\x9D\xA4");  // UTF-8 heart symbol
-    lv_obj_set_style_text_font(heart_icon, &lv_font_montserrat_30, 0);
-    lv_obj_align(heart_icon, LV_ALIGN_TOP_LEFT, 10, 10);
+    // Main dashboard container
+    lv_obj_t *main_container = lv_obj_create(scr);
+    lv_obj_set_size(main_container, 800, 340);
+    lv_obj_align(main_container, LV_ALIGN_TOP_MID, 0, 45);
+    lv_obj_set_style_bg_color(main_container, color_dark, 0);
+    lv_obj_set_style_border_width(main_container, 0, 0);
+    lv_obj_clear_flag(main_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *hr_title = lv_label_create(hr_panel);
-    lv_label_set_text(hr_title, "Heart Rate");
-    lv_obj_set_style_text_color(hr_title, color_red, 0);
-    lv_obj_align(hr_title, LV_ALIGN_TOP_LEFT, 50, 15);
+    // Center speed display
+    center_panel = lv_obj_create(main_container);
+    lv_obj_set_size(center_panel, 300, 280);
+    lv_obj_align(center_panel, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_set_style_bg_color(center_panel, LV_COLOR_MAKE(0x15, 0x15, 0x15), 0);
+    lv_obj_set_style_border_width(center_panel, 2, 0);
+    lv_obj_set_style_border_color(center_panel, color_gray, 0);
+    lv_obj_set_style_radius(center_panel, 15, 0);
+    lv_obj_clear_flag(center_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    heart_rate_label = lv_label_create(hr_panel);
-    lv_label_set_text(heart_rate_label, "72");
-    lv_obj_set_style_text_font(heart_rate_label, &lv_font_montserrat_48, 0);
-    lv_obj_set_style_text_color(heart_rate_label, lv_color_white(), 0);
-    lv_obj_align(heart_rate_label, LV_ALIGN_CENTER, -30, -10);
+    // Speed display
+    speed_label = lv_label_create(center_panel);
+    lv_label_set_text(speed_label, "0");
+    lv_obj_set_style_text_font(speed_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(speed_label, color_white, 0);
+    lv_obj_align(speed_label, LV_ALIGN_CENTER, 0, -20);
 
-    lv_obj_t *bpm_label = lv_label_create(hr_panel);
-    lv_label_set_text(bpm_label, "BPM");
-    lv_obj_set_style_text_color(bpm_label, LV_COLOR_MAKE(0xAA, 0xAA, 0xAA), 0);
-    lv_obj_align(bpm_label, LV_ALIGN_CENTER, 30, -5);
+    speed_unit_label = lv_label_create(center_panel);
+    lv_label_set_text(speed_unit_label, "km/h");
+    lv_obj_set_style_text_color(speed_unit_label, color_gray, 0);
+    lv_obj_align(speed_unit_label, LV_ALIGN_CENTER, 0, 20);
 
-    heart_chart = lv_chart_create(hr_panel);
-    lv_obj_set_size(heart_chart, 200, 60);
-    lv_obj_align(heart_chart, LV_ALIGN_BOTTOM_MID, 0, -5);
-    lv_chart_set_type(heart_chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(heart_chart, 50);
-    lv_chart_set_range(heart_chart, LV_CHART_AXIS_PRIMARY_Y, 40, 120);
-    lv_obj_set_style_bg_opa(heart_chart, LV_OPA_20, 0);
-    lv_obj_set_style_size(heart_chart, 0, LV_PART_INDICATOR);
-    heart_series = lv_chart_add_series(heart_chart, color_red, LV_CHART_AXIS_PRIMARY_Y);
+    // Gear selector display
+    gear_selector = lv_label_create(center_panel);
+    lv_label_set_text_fmt(gear_selector, "%c", vehicle.gear);
+    lv_obj_set_style_text_font(gear_selector, &lv_font_montserrat_30, 0);
+    lv_obj_set_style_text_color(gear_selector, color_tesla_blue, 0);
+    lv_obj_align(gear_selector, LV_ALIGN_TOP_MID, 0, 10);
 
-    // Breathing rate panel (below heart rate)
-    lv_obj_t *br_panel = lv_obj_create(scr);
-    lv_obj_set_size(br_panel, 200, 140);
-    lv_obj_align(br_panel, LV_ALIGN_TOP_MID, -20, 205);
-    lv_obj_set_style_bg_color(br_panel, color_dark, 0);
-    lv_obj_set_style_border_color(br_panel, color_blue, 0);
-    lv_obj_set_style_border_width(br_panel, 2, 0);
-    lv_obj_clear_flag(br_panel, LV_OBJ_FLAG_SCROLLABLE);
+    // Autopilot indicator
+    lv_obj_t *autopilot_status = lv_obj_create(center_panel);
+    lv_obj_set_size(autopilot_status, 120, 30);
+    lv_obj_align(autopilot_status, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(autopilot_status, color_gray, 0);
+    lv_obj_set_style_radius(autopilot_status, 15, 0);
+    lv_obj_clear_flag(autopilot_status, LV_OBJ_FLAG_SCROLLABLE);
 
-    breath_icon = lv_label_create(br_panel);
-    lv_label_set_text(breath_icon, LV_SYMBOL_REFRESH);
-    lv_obj_set_style_text_font(breath_icon, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(breath_icon, color_blue, 0);
-    lv_obj_align(breath_icon, LV_ALIGN_TOP_LEFT, 10, 10);
+    lv_obj_t *ap_label = lv_label_create(autopilot_status);
+    lv_label_set_text(ap_label, "AUTOPILOT");
+    lv_obj_set_style_text_font(ap_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ap_label, color_white, 0);
+    lv_obj_center(ap_label);
 
-    lv_obj_t *br_title = lv_label_create(br_panel);
-    lv_label_set_text(br_title, "Breathing");
-    lv_obj_set_style_text_color(br_title, color_blue, 0);
-    lv_obj_align(br_title, LV_ALIGN_TOP_LEFT, 40, 10);
+    // Left panel - Power meter
+    left_panel = lv_obj_create(main_container);
+    lv_obj_set_size(left_panel, 200, 280);
+    lv_obj_align(left_panel, LV_ALIGN_LEFT_MID, 10, -20);
+    lv_obj_set_style_bg_color(left_panel, LV_COLOR_MAKE(0x15, 0x15, 0x15), 0);
+    lv_obj_set_style_border_width(left_panel, 2, 0);
+    lv_obj_set_style_border_color(left_panel, color_gray, 0);
+    lv_obj_set_style_radius(left_panel, 15, 0);
+    lv_obj_clear_flag(left_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    breathing_rate_label = lv_label_create(br_panel);
-    lv_label_set_text(breathing_rate_label, "16");
-    lv_obj_set_style_text_font(breathing_rate_label, &lv_font_montserrat_30, 0);
-    lv_obj_set_style_text_color(breathing_rate_label, lv_color_white(), 0);
-    lv_obj_align(breathing_rate_label, LV_ALIGN_LEFT_MID, 20, 10);
+    lv_obj_t *power_title = lv_label_create(left_panel);
+    lv_label_set_text(power_title, "POWER");
+    lv_obj_set_style_text_color(power_title, color_white, 0);
+    lv_obj_align(power_title, LV_ALIGN_TOP_MID, 0, 10);
 
-    lv_obj_t *rpm_label = lv_label_create(br_panel);
-    lv_label_set_text(rpm_label, "RPM");
-    lv_obj_set_style_text_color(rpm_label, LV_COLOR_MAKE(0xAA, 0xAA, 0xAA), 0);
-    lv_obj_align(rpm_label, LV_ALIGN_LEFT_MID, 70, 10);
+    // Power meter bar
+    power_meter = lv_bar_create(left_panel);
+    lv_obj_set_size(power_meter, 160, 30);
+    lv_obj_align(power_meter, LV_ALIGN_TOP_MID, 0, 40);
+    lv_bar_set_range(power_meter, 0, 200);
+    lv_bar_set_value(power_meter, 100, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(power_meter, color_gray, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(power_meter, color_green, LV_PART_INDICATOR);
 
-    breathing_chart = lv_chart_create(br_panel);
-    lv_obj_set_size(breathing_chart, 200, 40);
-    lv_obj_align(breathing_chart, LV_ALIGN_BOTTOM_MID, 0, -5);
-    lv_chart_set_type(breathing_chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(breathing_chart, 30);
-    lv_chart_set_range(breathing_chart, LV_CHART_AXIS_PRIMARY_Y, 8, 30);
-    lv_obj_set_style_bg_opa(breathing_chart, LV_OPA_20, 0);
-    lv_obj_set_style_size(breathing_chart, 0, LV_PART_INDICATOR);
-    breathing_series = lv_chart_add_series(breathing_chart, color_blue, LV_CHART_AXIS_PRIMARY_Y);
+    // Power chart
+    power_chart = lv_chart_create(left_panel);
+    lv_obj_set_size(power_chart, 180, 100);
+    lv_obj_align(power_chart, LV_ALIGN_CENTER, 0, 20);
+    lv_chart_set_type(power_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(power_chart, 50);
+    lv_chart_set_range(power_chart, LV_CHART_AXIS_PRIMARY_Y, -100, 200);
+    lv_obj_set_style_bg_opa(power_chart, LV_OPA_20, 0);
 
-    // Status panel (bottom)
-    lv_obj_t *status_panel = lv_obj_create(scr);
-    lv_obj_set_size(status_panel, 440, 60);
-    lv_obj_align(status_panel, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(status_panel, color_dark, 0);
-    lv_obj_set_style_border_width(status_panel, 0, 0);
-    lv_obj_clear_flag(status_panel, LV_OBJ_FLAG_SCROLLABLE);
+    power_series = lv_chart_add_series(power_chart, color_green, LV_CHART_AXIS_PRIMARY_Y);
+    regen_series = lv_chart_add_series(power_chart, color_orange, LV_CHART_AXIS_PRIMARY_Y);
 
-    status_label = lv_label_create(status_panel);
-    lv_label_set_text(status_label, "Initializing...");
-    lv_obj_set_style_text_color(status_label, color_green, 0);
-    lv_obj_align(status_label, LV_ALIGN_LEFT_MID, 10, -10);
+    // Turn signals
+    left_turn_signal = lv_btn_create(left_panel);
+    lv_obj_set_size(left_turn_signal, 40, 40);
+    lv_obj_align(left_turn_signal, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+    lv_obj_set_style_bg_color(left_turn_signal, color_green, 0);
+    lv_obj_add_event_cb(left_turn_signal, turn_signal_event_cb, LV_EVENT_CLICKED, NULL);
 
-    distance_label = lv_label_create(status_panel);
-    lv_label_set_text(distance_label, "Distance: --");
-    lv_obj_set_style_text_color(distance_label, color_cyan, 0);
-    lv_obj_align(distance_label, LV_ALIGN_CENTER, 0, -10);
+    lv_obj_t *left_arrow = lv_label_create(left_turn_signal);
+    lv_label_set_text(left_arrow, LV_SYMBOL_LEFT);
+    lv_obj_center(left_arrow);
 
-    lv_obj_t *signal_label = lv_label_create(status_panel);
-    lv_label_set_text(signal_label, "Signal:");
-    lv_obj_set_style_text_color(signal_label, lv_color_white(), 0);
-    lv_obj_align(signal_label, LV_ALIGN_RIGHT_MID, -120, -10);
+    // Right panel - Battery & Range
+    right_panel = lv_obj_create(main_container);
+    lv_obj_set_size(right_panel, 200, 280);
+    lv_obj_align(right_panel, LV_ALIGN_RIGHT_MID, -10, -20);
+    lv_obj_set_style_bg_color(right_panel, LV_COLOR_MAKE(0x15, 0x15, 0x15), 0);
+    lv_obj_set_style_border_width(right_panel, 2, 0);
+    lv_obj_set_style_border_color(right_panel, color_gray, 0);
+    lv_obj_set_style_radius(right_panel, 15, 0);
+    lv_obj_clear_flag(right_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    signal_meter = lv_bar_create(status_panel);
-    lv_obj_set_size(signal_meter, 100, 15);
-    lv_obj_align(signal_meter, LV_ALIGN_RIGHT_MID, -10, -10);
-    lv_bar_set_range(signal_meter, 0, 100);
-    lv_obj_set_style_bg_color(signal_meter, LV_COLOR_MAKE(0x40, 0x40, 0x40), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(signal_meter, color_green, LV_PART_INDICATOR);
+    lv_obj_t *battery_title = lv_label_create(right_panel);
+    lv_label_set_text(battery_title, "BATTERY");
+    lv_obj_set_style_text_color(battery_title, color_white, 0);
+    lv_obj_align(battery_title, LV_ALIGN_TOP_MID, 0, 10);
 
-    // Settings Panel with Touch Controls (right side)
-    settings_panel = lv_obj_create(scr);
-    lv_obj_set_size(settings_panel, 320, 350);
-    lv_obj_align(settings_panel, LV_ALIGN_RIGHT_MID, -10, 10);
-    lv_obj_set_style_bg_color(settings_panel, LV_COLOR_MAKE(0x2A, 0x2A, 0x2A), 0);
-    lv_obj_set_style_border_color(settings_panel, LV_COLOR_MAKE(0x60, 0x60, 0x60), 0);
-    lv_obj_set_style_border_width(settings_panel, 2, 0);
-    lv_obj_clear_flag(settings_panel, LV_OBJ_FLAG_SCROLLABLE);
+    // Battery visualization
+    battery_container = lv_obj_create(right_panel);
+    lv_obj_set_size(battery_container, 160, 80);
+    lv_obj_align(battery_container, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_bg_color(battery_container, color_gray, 0);
+    lv_obj_set_style_radius(battery_container, 10, 0);
+    lv_obj_clear_flag(battery_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Settings title
-    lv_obj_t *settings_title = lv_label_create(settings_panel);
-    lv_label_set_text(settings_title, "Touch Controls");
-    lv_obj_set_style_text_font(settings_title, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(settings_title, color_cyan, 0);
-    lv_obj_align(settings_title, LV_ALIGN_TOP_MID, 0, 5);
+    battery_bar = lv_bar_create(battery_container);
+    lv_obj_set_size(battery_bar, 140, 60);
+    lv_obj_center(battery_bar);
+    lv_bar_set_range(battery_bar, 0, 100);
+    lv_bar_set_value(battery_bar, vehicle.battery_percent, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(battery_bar, LV_COLOR_MAKE(0x30, 0x30, 0x30), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(battery_bar, color_green, LV_PART_INDICATOR);
 
-    // Sensitivity Slider
-    sensitivity_label = lv_label_create(settings_panel);
-    lv_label_set_text_fmt(sensitivity_label, "Sensitivity: %d%%", (int)sensitivity);
-    lv_obj_set_style_text_color(sensitivity_label, lv_color_white(), 0);
-    lv_obj_align(sensitivity_label, LV_ALIGN_TOP_LEFT, 10, 35);
+    battery_label = lv_label_create(battery_container);
+    lv_label_set_text_fmt(battery_label, "%d%%", vehicle.battery_percent);
+    lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(battery_label, color_white, 0);
+    lv_obj_center(battery_label);
 
-    sensitivity_slider = lv_slider_create(settings_panel);
-    lv_obj_set_size(sensitivity_slider, 250, 20);
-    lv_obj_align(sensitivity_slider, LV_ALIGN_TOP_MID, 0, 60);
-    lv_slider_set_range(sensitivity_slider, 10, 100);
-    lv_slider_set_value(sensitivity_slider, sensitivity, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(sensitivity_slider, LV_COLOR_MAKE(0x40, 0x40, 0x40), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(sensitivity_slider, color_green, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(sensitivity_slider, color_cyan, LV_PART_KNOB);
-    lv_obj_add_event_cb(sensitivity_slider, sensitivity_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    // Range display
+    lv_obj_t *range_title = lv_label_create(right_panel);
+    lv_label_set_text(range_title, "EST. RANGE");
+    lv_obj_set_style_text_color(range_title, color_gray, 0);
+    lv_obj_align(range_title, LV_ALIGN_TOP_MID, 0, 130);
 
-    // Mode Selection
-    mode_label = lv_label_create(settings_panel);
-    lv_label_set_text(mode_label, "Mode: Normal");
-    lv_obj_set_style_text_color(mode_label, lv_color_white(), 0);
-    lv_obj_align(mode_label, LV_ALIGN_TOP_LEFT, 10, 90);
+    range_label = lv_label_create(right_panel);
+    lv_label_set_text_fmt(range_label, "%d km", vehicle.range_km);
+    lv_obj_set_style_text_font(range_label, &lv_font_montserrat_30, 0);
+    lv_obj_set_style_text_color(range_label, color_white, 0);
+    lv_obj_align(range_label, LV_ALIGN_TOP_MID, 0, 150);
 
-    static const char * mode_map[] = {"Normal", "Precision", "Long Range", ""};
-    mode_btn_group = lv_btnmatrix_create(settings_panel);
-    lv_btnmatrix_set_map(mode_btn_group, mode_map);
-    lv_obj_set_size(mode_btn_group, 250, 50);
-    lv_obj_align(mode_btn_group, LV_ALIGN_TOP_MID, 0, 115);
-    lv_btnmatrix_set_btn_ctrl_all(mode_btn_group, LV_BTNMATRIX_CTRL_CHECKABLE);
-    lv_btnmatrix_clear_btn_ctrl(mode_btn_group, 0, LV_BTNMATRIX_CTRL_CHECKABLE);
-    lv_btnmatrix_set_btn_ctrl(mode_btn_group, 0, LV_BTNMATRIX_CTRL_CHECKABLE | LV_BTNMATRIX_CTRL_CHECKED);
-    lv_btnmatrix_set_one_checked(mode_btn_group, true);
-    lv_btnmatrix_set_selected_btn(mode_btn_group, 0);
-    lv_obj_add_event_cb(mode_btn_group, mode_btn_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    // Turn signal right
+    right_turn_signal = lv_btn_create(right_panel);
+    lv_obj_set_size(right_turn_signal, 40, 40);
+    lv_obj_align(right_turn_signal, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+    lv_obj_set_style_bg_color(right_turn_signal, color_green, 0);
+    lv_obj_add_event_cb(right_turn_signal, turn_signal_event_cb, LV_EVENT_CLICKED, NULL);
 
-    // Noise Filter Switch
-    lv_obj_t *filter_label = lv_label_create(settings_panel);
-    lv_label_set_text(filter_label, "Noise Filter:");
-    lv_obj_set_style_text_color(filter_label, lv_color_white(), 0);
-    lv_obj_align(filter_label, LV_ALIGN_TOP_LEFT, 10, 175);
+    lv_obj_t *right_arrow = lv_label_create(right_turn_signal);
+    lv_label_set_text(right_arrow, LV_SYMBOL_RIGHT);
+    lv_obj_center(right_arrow);
 
-    noise_filter_switch = lv_switch_create(settings_panel);
-    lv_obj_align(noise_filter_switch, LV_ALIGN_TOP_LEFT, 100, 170);
-    if (noise_filter_enabled) lv_obj_add_state(noise_filter_switch, LV_STATE_CHECKED);
-    lv_obj_add_event_cb(noise_filter_switch, noise_filter_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    // Bottom control panel with touch buttons
+    bottom_panel = lv_obj_create(scr);
+    lv_obj_set_size(bottom_panel, 800, 90);
+    lv_obj_align(bottom_panel, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(bottom_panel, LV_COLOR_MAKE(0x20, 0x20, 0x20), 0);
+    lv_obj_set_style_border_width(bottom_panel, 0, 0);
+    lv_obj_clear_flag(bottom_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Calibration Buttons
-    calibrate_btn = lv_btn_create(settings_panel);
-    lv_obj_set_size(calibrate_btn, 115, 40);
-    lv_obj_align(calibrate_btn, LV_ALIGN_TOP_LEFT, 10, 210);
-    lv_obj_set_style_bg_color(calibrate_btn, LV_COLOR_MAKE(0x00, 0x60, 0xA0), 0);
-    lv_obj_add_event_cb(calibrate_btn, calibrate_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    // Gear selector buttons
+    park_btn = lv_btn_create(bottom_panel);
+    lv_obj_set_size(park_btn, 60, 60);
+    lv_obj_align(park_btn, LV_ALIGN_LEFT_MID, 20, 0);
+    lv_obj_set_style_bg_color(park_btn, vehicle.gear == 'P' ? color_tesla_blue : color_gray, 0);
+    lv_obj_add_event_cb(park_btn, gear_select_event_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *cal_label = lv_label_create(calibrate_btn);
-    lv_label_set_text(cal_label, "Calibrate");
-    lv_obj_center(cal_label);
+    lv_obj_t *p_label = lv_label_create(park_btn);
+    lv_label_set_text(p_label, "P");
+    lv_obj_set_style_text_font(p_label, &lv_font_montserrat_20, 0);
+    lv_obj_center(p_label);
 
-    baseline_btn = lv_btn_create(settings_panel);
-    lv_obj_set_size(baseline_btn, 115, 40);
-    lv_obj_align(baseline_btn, LV_ALIGN_TOP_RIGHT, -10, 210);
-    lv_obj_set_style_bg_color(baseline_btn, LV_COLOR_MAKE(0xA0, 0x60, 0x00), 0);
-    lv_obj_add_event_cb(baseline_btn, baseline_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    reverse_btn = lv_btn_create(bottom_panel);
+    lv_obj_set_size(reverse_btn, 60, 60);
+    lv_obj_align(reverse_btn, LV_ALIGN_LEFT_MID, 90, 0);
+    lv_obj_set_style_bg_color(reverse_btn, color_gray, 0);
+    lv_obj_add_event_cb(reverse_btn, gear_select_event_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *base_label = lv_label_create(baseline_btn);
-    lv_label_set_text(base_label, "Reset Base");
-    lv_obj_center(base_label);
+    lv_obj_t *r_label = lv_label_create(reverse_btn);
+    lv_label_set_text(r_label, "R");
+    lv_obj_set_style_text_font(r_label, &lv_font_montserrat_20, 0);
+    lv_obj_center(r_label);
 
-    // Info text
-    lv_obj_t *info_label = lv_label_create(settings_panel);
-    lv_label_set_text(info_label, "Touch to adjust settings");
-    lv_obj_set_style_text_font(info_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(info_label, LV_COLOR_MAKE(0x80, 0x80, 0x80), 0);
-    lv_obj_align(info_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+    neutral_btn = lv_btn_create(bottom_panel);
+    lv_obj_set_size(neutral_btn, 60, 60);
+    lv_obj_align(neutral_btn, LV_ALIGN_LEFT_MID, 160, 0);
+    lv_obj_set_style_bg_color(neutral_btn, color_gray, 0);
+    lv_obj_add_event_cb(neutral_btn, gear_select_event_cb, LV_EVENT_CLICKED, NULL);
 
-    // Initialize data
-    for (int i = 0; i < 360; i++) {
-        radar_points[i] = 0;
-    }
+    lv_obj_t *n_label = lv_label_create(neutral_btn);
+    lv_label_set_text(n_label, "N");
+    lv_obj_set_style_text_font(n_label, &lv_font_montserrat_20, 0);
+    lv_obj_center(n_label);
+
+    drive_btn = lv_btn_create(bottom_panel);
+    lv_obj_set_size(drive_btn, 60, 60);
+    lv_obj_align(drive_btn, LV_ALIGN_LEFT_MID, 230, 0);
+    lv_obj_set_style_bg_color(drive_btn, color_gray, 0);
+    lv_obj_add_event_cb(drive_btn, gear_select_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *d_label = lv_label_create(drive_btn);
+    lv_label_set_text(d_label, "D");
+    lv_obj_set_style_text_font(d_label, &lv_font_montserrat_20, 0);
+    lv_obj_center(d_label);
+
+    // Autopilot button
+    autopilot_btn = lv_btn_create(bottom_panel);
+    lv_obj_set_size(autopilot_btn, 140, 60);
+    lv_obj_align(autopilot_btn, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(autopilot_btn, color_gray, 0);
+    lv_obj_add_event_cb(autopilot_btn, autopilot_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *ap_btn_label = lv_label_create(autopilot_btn);
+    lv_label_set_text(ap_btn_label, "AUTOPILOT OFF");
+    lv_obj_center(ap_btn_label);
+
+    // Climate control slider
+    temp_slider = lv_slider_create(bottom_panel);
+    lv_obj_set_size(temp_slider, 120, 20);
+    lv_obj_align(temp_slider, LV_ALIGN_RIGHT_MID, -150, -20);
+    lv_slider_set_range(temp_slider, 16, 28);
+    lv_slider_set_value(temp_slider, vehicle.climate_temp, LV_ANIM_OFF);
+    lv_obj_add_event_cb(temp_slider, climate_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *climate_label = lv_label_create(bottom_panel);
+    lv_label_set_text(climate_label, "CLIMATE");
+    lv_obj_set_style_text_font(climate_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(climate_label, color_gray, 0);
+    lv_obj_align(climate_label, LV_ALIGN_RIGHT_MID, -180, 10);
+
+    // Volume slider
+    volume_slider = lv_slider_create(bottom_panel);
+    lv_obj_set_size(volume_slider, 100, 20);
+    lv_obj_align(volume_slider, LV_ALIGN_RIGHT_MID, -20, -20);
+    lv_slider_set_range(volume_slider, 0, 100);
+    lv_slider_set_value(volume_slider, vehicle.volume, LV_ANIM_OFF);
+    lv_obj_add_event_cb(volume_slider, volume_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *volume_label = lv_label_create(bottom_panel);
+    lv_label_set_text(volume_label, "VOLUME");
+    lv_obj_set_style_text_font(volume_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(volume_label, color_gray, 0);
+    lv_obj_align(volume_label, LV_ALIGN_RIGHT_MID, -40, 10);
 }
 
 void setup() {
     Serial.begin(115200);
     delay(100);
 
-    Serial.println("ESP32-S3 WiFi CSI Vital Signs Radar");
-    Serial.println("Non-contact Heart Rate & Breathing Detection");
+    Serial.println("Tesla-Style Dashboard with Touch Controls");
+    Serial.println("ESP32-S3 7\" Waveshare Touch LCD");
 
     // Initialize board
     Serial.println("Initializing display board...");
@@ -679,25 +537,18 @@ void setup() {
     Serial.println("Initializing LVGL...");
     lvgl_port_init(board->getLCD(), board->getTouch());
 
-    // Initialize WiFi CSI
-    Serial.println("Setting up WiFi CSI...");
-    setup_wifi_csi();
-
-    // Create UI
-    Serial.println("Creating radar UI...");
+    // Create dashboard UI
+    Serial.println("Creating Tesla dashboard UI...");
     lvgl_port_lock(-1);
-    create_radar_ui();
-
-    // Create timers
-    radar_timer = lv_timer_create(draw_radar, 50, NULL);  // 20 FPS radar
-    update_timer = lv_timer_create(update_display, 100, NULL);  // 10 Hz update
-
+    create_tesla_dashboard();
     lvgl_port_unlock();
 
-    Serial.println("Vital Signs Radar Ready!");
-    Serial.println("Place hand or chest near device for detection");
+    // Create update timer
+    update_timer = lv_timer_create(update_dashboard, 100, NULL);
+
+    Serial.println("Dashboard ready! Touch controls enabled.");
 }
 
 void loop() {
-    delay(10);
+    delay(5);
 }
