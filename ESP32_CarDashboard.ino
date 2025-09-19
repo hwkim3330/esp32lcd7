@@ -1,531 +1,988 @@
 /**
- * Tesla-Style Dashboard with Touch Controls
- * ESP32-S3 7" Waveshare Touch LCD
- * Inspired by VelocityDRIVE CT & Tesla Model S/3
+ * Advanced WiFi LiDAR Visualization System
+ * Real-time WiFi Environment Mapping & Analysis
+ * ESP32-S3 7" Touch LCD - Professional Grade
  */
 
 #include <Arduino.h>
 #include <esp_display_panel.hpp>
 #include <lvgl.h>
 #include "lvgl_v8_port.h"
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_wifi_types.h>
+#include <math.h>
+#include <map>
+#include <vector>
+#include <algorithm>
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
 
 Board *board = NULL;
 
-// UI Objects - Main Dashboard
+// Constants
+#define MAX_NETWORKS 32
+#define MAX_STATIONS 64
+#define SCAN_INTERVAL 500
+#define HISTORY_SIZE 50
+#define RADAR_RADIUS 150
+#define SPECTRUM_WIDTH 460
+#define SPECTRUM_HEIGHT 80
+#define CHANNEL_WIDTH 20
+#define MAX_CHANNELS 14
+
+// WiFi AP Information Structure
+struct WiFiAP {
+    String ssid;
+    String bssid;
+    int32_t rssi;
+    int channel;
+    wifi_auth_mode_t encryption;
+    float distance;  // Calculated distance in meters
+    float angle;     // Position angle for visualization
+    float x, y;      // Calculated position
+    uint32_t lastSeen;
+    int history[HISTORY_SIZE];
+    int historyIndex;
+    float avgRssi;
+    float variance;
+    bool isMoving;
+    float velocity;
+};
+
+// WiFi Station Information
+struct WiFiStation {
+    uint8_t mac[6];
+    int32_t rssi;
+    float distance;
+    uint32_t lastSeen;
+    int channel;
+    bool isActive;
+};
+
+// Channel Information
+struct ChannelInfo {
+    int apCount;
+    int stationCount;
+    float utilization;
+    float interference;
+    int maxRssi;
+    int minRssi;
+};
+
+// Global WiFi Data
+static std::map<String, WiFiAP> wifiNetworks;
+static std::vector<WiFiStation> wifiStations;
+static ChannelInfo channels[MAX_CHANNELS + 1];
+static int currentChannel = 1;
+static bool isScanning = false;
+static bool promiscuousMode = false;
+
+// UI Objects - Main Display
 static lv_obj_t *scr;
-static lv_obj_t *speed_gauge;
-static lv_obj_t *speed_label;
-static lv_obj_t *speed_unit_label;
-static lv_obj_t *power_meter;
-static lv_obj_t *battery_container;
-static lv_obj_t *battery_bar;
-static lv_obj_t *battery_label;
-static lv_obj_t *range_label;
-static lv_obj_t *gear_selector;
-static lv_obj_t *drive_mode_label;
+static lv_obj_t *radar_canvas;
+static lv_obj_t *spectrum_canvas;
+static lv_obj_t *heatmap_canvas;
+static lv_obj_t *info_panel;
+static lv_obj_t *stats_panel;
+static lv_obj_t *control_panel;
 
-// Touch Control Panels
-static lv_obj_t *left_panel;
-static lv_obj_t *center_panel;
-static lv_obj_t *right_panel;
-static lv_obj_t *bottom_panel;
+// UI Objects - Information Labels
+static lv_obj_t *network_count_label;
+static lv_obj_t *station_count_label;
+static lv_obj_t *channel_label;
+static lv_obj_t *strongest_label;
+static lv_obj_t *weakest_label;
+static lv_obj_t *interference_label;
+static lv_obj_t *scan_status_label;
+static lv_obj_t *mode_label;
 
-// Touch Controls
-static lv_obj_t *climate_btn;
-static lv_obj_t *media_btn;
-static lv_obj_t *nav_btn;
-static lv_obj_t *phone_btn;
-static lv_obj_t *settings_btn;
-static lv_obj_t *autopilot_btn;
-static lv_obj_t *park_btn;
-static lv_obj_t *reverse_btn;
-static lv_obj_t *neutral_btn;
-static lv_obj_t *drive_btn;
-static lv_obj_t *temp_slider;
-static lv_obj_t *volume_slider;
-static lv_obj_t *brightness_slider;
+// UI Objects - Network List
+static lv_obj_t *network_list;
+static lv_obj_t *network_chart;
+static lv_chart_series_t *rssi_series[5];
 
-// Status Indicators
-static lv_obj_t *left_turn_signal;
-static lv_obj_t *right_turn_signal;
-static lv_obj_t *headlight_indicator;
-static lv_obj_t *parking_brake_indicator;
-static lv_obj_t *door_status[4];
-static lv_obj_t *tire_pressure[4];
-static lv_obj_t *temp_label;
-static lv_obj_t *time_label;
+// UI Objects - Controls
+static lv_obj_t *scan_btn;
+static lv_obj_t *promiscuous_btn;
+static lv_obj_t *channel_slider;
+static lv_obj_t *range_slider;
+static lv_obj_t *sensitivity_slider;
+static lv_obj_t *view_selector;
 
-// Charts and Visualizations
-static lv_obj_t *power_chart;
-static lv_obj_t *efficiency_chart;
-static lv_obj_t *nav_map;
-static lv_chart_series_t *power_series;
-static lv_chart_series_t *regen_series;
-static lv_chart_series_t *efficiency_series;
+// Display Settings
+static int viewMode = 0;  // 0: Radar, 1: Spectrum, 2: Heatmap, 3: 3D
+static float scanRange = 100.0;  // meters
+static float sensitivity = -90.0;  // dBm threshold
+static float radarAngle = 0;
+static uint8_t radarTrail[360][RADAR_RADIUS];
 
-// Animation timers
+// Animation & Timers
+static lv_timer_t *scan_timer;
 static lv_timer_t *update_timer;
 static lv_timer_t *animation_timer;
 
-// Vehicle State
-typedef struct {
-    int speed;
-    int target_speed;
-    int power;
-    int battery_percent;
-    int range_km;
-    char gear; // P, R, N, D
-    bool autopilot_enabled;
-    bool left_signal;
-    bool right_signal;
-    int temp_inside;
-    int temp_outside;
-    bool doors_locked;
-    bool lights_on;
-    float tire_pressure_psi[4];
-    int volume;
-    int brightness;
-    int climate_temp;
-} VehicleState;
-
-static VehicleState vehicle = {
-    .speed = 0,
-    .target_speed = 0,
-    .power = 0,
-    .battery_percent = 85,
-    .range_km = 380,
-    .gear = 'P',
-    .autopilot_enabled = false,
-    .left_signal = false,
-    .right_signal = false,
-    .temp_inside = 22,
-    .temp_outside = 18,
-    .doors_locked = true,
-    .lights_on = false,
-    .tire_pressure_psi = {32.5, 32.5, 32.0, 32.0},
-    .volume = 50,
-    .brightness = 70,
-    .climate_temp = 22
-};
-
-// Color scheme - Tesla inspired
-static lv_color_t color_tesla_red = LV_COLOR_MAKE(0xE3, 0x1C, 0x1C);
-static lv_color_t color_tesla_blue = LV_COLOR_MAKE(0x3D, 0x6C, 0xCE);
-static lv_color_t color_white = LV_COLOR_MAKE(0xFF, 0xFF, 0xFF);
-static lv_color_t color_gray = LV_COLOR_MAKE(0x4A, 0x4A, 0x4A);
-static lv_color_t color_dark = LV_COLOR_MAKE(0x1A, 0x1A, 0x1A);
-static lv_color_t color_green = LV_COLOR_MAKE(0x4A, 0xD3, 0x4A);
+// Color Scheme
+static lv_color_t color_green = LV_COLOR_MAKE(0x00, 0xFF, 0x00);
+static lv_color_t color_red = LV_COLOR_MAKE(0xFF, 0x00, 0x00);
+static lv_color_t color_blue = LV_COLOR_MAKE(0x00, 0x88, 0xFF);
+static lv_color_t color_yellow = LV_COLOR_MAKE(0xFF, 0xFF, 0x00);
+static lv_color_t color_cyan = LV_COLOR_MAKE(0x00, 0xFF, 0xFF);
+static lv_color_t color_purple = LV_COLOR_MAKE(0xFF, 0x00, 0xFF);
 static lv_color_t color_orange = LV_COLOR_MAKE(0xFF, 0xA5, 0x00);
+static lv_color_t color_dark = LV_COLOR_MAKE(0x0A, 0x0A, 0x0A);
+
+// Calculate distance from RSSI using path loss formula
+float calculateDistance(int32_t rssi, int frequency = 2437) {
+    // Path Loss = 20*log10(d) + 20*log10(f) + 32.44
+    // RSSI = -Path Loss
+    // Solving for d: d = 10^((abs(RSSI) - 32.44 - 20*log10(f)) / 20)
+
+    float pathLoss = abs(rssi);
+    float freqMHz = frequency;
+    float exp = (pathLoss - 32.44 - 20.0 * log10(freqMHz)) / 20.0;
+    float distance = pow(10.0, exp);
+
+    // Apply correction factor based on environment
+    distance *= 0.5;  // Indoor environment factor
+
+    return constrain(distance, 0.1, scanRange);
+}
+
+// Convert channel to frequency
+int channelToFrequency(int channel) {
+    if (channel >= 1 && channel <= 14) {
+        if (channel < 14) {
+            return 2412 + (channel - 1) * 5;
+        } else {
+            return 2484;  // Channel 14
+        }
+    }
+    // 5GHz band
+    if (channel >= 36 && channel <= 165) {
+        return 5180 + (channel - 36) * 5;
+    }
+    return 2437;  // Default
+}
+
+// WiFi Promiscuous Mode Callback
+void IRAM_ATTR promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (!promiscuousMode) return;
+
+    wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+    wifi_pkt_rx_ctrl_t* rx_ctrl = &pkt->rx_ctrl;
+
+    // Extract MAC addresses
+    uint8_t* data = pkt->payload;
+    uint8_t* addr1 = data + 4;   // Destination
+    uint8_t* addr2 = data + 10;  // Source
+    uint8_t* addr3 = data + 16;  // BSSID
+
+    // Create or update station info
+    WiFiStation station;
+    memcpy(station.mac, addr2, 6);
+    station.rssi = rx_ctrl->rssi;
+    station.distance = calculateDistance(rx_ctrl->rssi);
+    station.lastSeen = millis();
+    station.channel = rx_ctrl->channel;
+    station.isActive = true;
+
+    // Add to stations list
+    bool found = false;
+    for (auto& s : wifiStations) {
+        if (memcmp(s.mac, station.mac, 6) == 0) {
+            s = station;
+            found = true;
+            break;
+        }
+    }
+    if (!found && wifiStations.size() < MAX_STATIONS) {
+        wifiStations.push_back(station);
+    }
+
+    // Update channel info
+    if (rx_ctrl->channel <= MAX_CHANNELS) {
+        channels[rx_ctrl->channel].stationCount++;
+        channels[rx_ctrl->channel].utilization += 0.1;
+        if (channels[rx_ctrl->channel].utilization > 100) {
+            channels[rx_ctrl->channel].utilization = 100;
+        }
+    }
+}
+
+// Scan WiFi Networks
+void scanNetworks() {
+    if (isScanning) return;
+    isScanning = true;
+
+    // Clear old data
+    for (auto& ch : channels) {
+        ch.apCount = 0;
+        ch.interference = 0;
+        ch.maxRssi = -100;
+        ch.minRssi = 0;
+    }
+
+    // Perform WiFi scan
+    int n = WiFi.scanNetworks(false, true, false, 300, currentChannel);
+
+    for (int i = 0; i < n && i < MAX_NETWORKS; i++) {
+        String bssid = WiFi.BSSIDstr(i);
+
+        // Update or create AP entry
+        WiFiAP& ap = wifiNetworks[bssid];
+        ap.ssid = WiFi.SSID(i);
+        ap.bssid = bssid;
+        ap.rssi = WiFi.RSSI(i);
+        ap.channel = WiFi.channel(i);
+        ap.encryption = (wifi_auth_mode_t)WiFi.encryptionType(i);
+        ap.distance = calculateDistance(ap.rssi, channelToFrequency(ap.channel));
+        ap.lastSeen = millis();
+
+        // Update history
+        ap.history[ap.historyIndex] = ap.rssi;
+        ap.historyIndex = (ap.historyIndex + 1) % HISTORY_SIZE;
+
+        // Calculate average RSSI and variance
+        float sum = 0, sumSq = 0;
+        int count = 0;
+        for (int j = 0; j < HISTORY_SIZE; j++) {
+            if (ap.history[j] != 0) {
+                sum += ap.history[j];
+                sumSq += ap.history[j] * ap.history[j];
+                count++;
+            }
+        }
+        if (count > 0) {
+            ap.avgRssi = sum / count;
+            ap.variance = (sumSq / count) - (ap.avgRssi * ap.avgRssi);
+            ap.isMoving = ap.variance > 100;  // High variance indicates movement
+        }
+
+        // Calculate position for visualization
+        ap.angle = (i * 360.0 / n) + random(-20, 20);  // Spread out evenly with some randomness
+        float distancePixels = map(ap.distance, 0, scanRange, 0, RADAR_RADIUS);
+        ap.x = cos(ap.angle * PI / 180.0) * distancePixels;
+        ap.y = sin(ap.angle * PI / 180.0) * distancePixels;
+
+        // Update channel statistics
+        if (ap.channel <= MAX_CHANNELS) {
+            channels[ap.channel].apCount++;
+            if (ap.rssi > channels[ap.channel].maxRssi) {
+                channels[ap.channel].maxRssi = ap.rssi;
+            }
+            if (ap.rssi < channels[ap.channel].minRssi) {
+                channels[ap.channel].minRssi = ap.rssi;
+            }
+        }
+    }
+
+    // Calculate channel interference
+    for (int ch = 1; ch <= MAX_CHANNELS; ch++) {
+        // Check adjacent channel interference
+        float interference = 0;
+        if (ch > 1) interference += channels[ch-1].apCount * 0.5;
+        if (ch < MAX_CHANNELS) interference += channels[ch+1].apCount * 0.5;
+        if (ch > 2) interference += channels[ch-2].apCount * 0.25;
+        if (ch < MAX_CHANNELS-1) interference += channels[ch+2].apCount * 0.25;
+
+        channels[ch].interference = interference;
+    }
+
+    isScanning = false;
+}
+
+// Draw Radar Display
+void drawRadar(lv_timer_t *timer) {
+    static lv_color_t *buf = nullptr;
+    if (!buf) {
+        buf = (lv_color_t*)ps_malloc(RADAR_RADIUS * 2 * RADAR_RADIUS * 2 * sizeof(lv_color_t));
+        if (!buf) return;
+    }
+    lv_canvas_set_buffer(radar_canvas, buf, RADAR_RADIUS * 2, RADAR_RADIUS * 2, LV_IMG_CF_TRUE_COLOR);
+
+    // Clear with slight fade for trail effect
+    for (int y = 0; y < RADAR_RADIUS * 2; y++) {
+        for (int x = 0; x < RADAR_RADIUS * 2; x++) {
+            int idx = y * RADAR_RADIUS * 2 + x;
+            lv_color_t current = buf[idx];
+            buf[idx] = lv_color_mix(color_dark, current, 240);  // Fade to dark
+        }
+    }
+
+    // Draw radar circles
+    lv_draw_arc_dsc_t arc_dsc;
+    lv_draw_arc_dsc_init(&arc_dsc);
+    arc_dsc.color = LV_COLOR_MAKE(0x00, 0x40, 0x00);
+    arc_dsc.width = 1;
+
+    for (int r = 30; r <= RADAR_RADIUS; r += 30) {
+        lv_canvas_draw_arc(radar_canvas, RADAR_RADIUS, RADAR_RADIUS, r, 0, 360, &arc_dsc);
+    }
+
+    // Draw cross lines
+    lv_draw_line_dsc_t line_dsc;
+    lv_draw_line_dsc_init(&line_dsc);
+    line_dsc.color = LV_COLOR_MAKE(0x00, 0x40, 0x00);
+    line_dsc.width = 1;
+
+    lv_point_t line_points[2];
+
+    // Draw grid lines
+    for (int angle = 0; angle < 360; angle += 30) {
+        float rad = angle * PI / 180.0;
+        line_points[0].x = RADAR_RADIUS;
+        line_points[0].y = RADAR_RADIUS;
+        line_points[1].x = RADAR_RADIUS + cos(rad) * RADAR_RADIUS;
+        line_points[1].y = RADAR_RADIUS - sin(rad) * RADAR_RADIUS;
+        lv_canvas_draw_line(radar_canvas, line_points, 2, &line_dsc);
+    }
+
+    // Draw range labels
+    lv_draw_label_dsc_t label_dsc;
+    lv_draw_label_dsc_init(&label_dsc);
+    label_dsc.color = LV_COLOR_MAKE(0x00, 0x80, 0x00);
+
+    for (int r = 30; r <= RADAR_RADIUS; r += 60) {
+        float distance = (r * scanRange) / RADAR_RADIUS;
+        char distStr[10];
+        snprintf(distStr, sizeof(distStr), "%.0fm", distance);
+        lv_canvas_draw_text(radar_canvas, RADAR_RADIUS + 5, RADAR_RADIUS - r - 5,
+                           50, &label_dsc, distStr);
+    }
+
+    // Draw sweep line
+    radarAngle += 2;
+    if (radarAngle >= 360) radarAngle = 0;
+
+    float sweepRad = radarAngle * PI / 180.0;
+    line_dsc.color = color_green;
+    line_dsc.width = 2;
+
+    // Draw sweep with gradient
+    for (int i = 0; i < 20; i++) {
+        float angle = radarAngle - i * 2;
+        if (angle < 0) angle += 360;
+        float rad = angle * PI / 180.0;
+
+        line_dsc.opa = 255 - i * 12;
+        line_points[0].x = RADAR_RADIUS;
+        line_points[0].y = RADAR_RADIUS;
+        line_points[1].x = RADAR_RADIUS + cos(rad) * RADAR_RADIUS;
+        line_points[1].y = RADAR_RADIUS - sin(rad) * RADAR_RADIUS;
+        lv_canvas_draw_line(radar_canvas, line_points, 2, &line_dsc);
+    }
+
+    // Draw WiFi APs
+    lv_draw_rect_dsc_t rect_dsc;
+    lv_draw_rect_dsc_init(&rect_dsc);
+
+    for (auto& pair : wifiNetworks) {
+        WiFiAP& ap = pair.second;
+
+        // Skip if too old or too weak
+        if (millis() - ap.lastSeen > 10000) continue;
+        if (ap.rssi < sensitivity) continue;
+
+        // Calculate position
+        float distancePixels = map(ap.distance, 0, scanRange, 0, RADAR_RADIUS);
+        int x = RADAR_RADIUS + ap.x;
+        int y = RADAR_RADIUS - ap.y;
+
+        // Choose color based on signal strength
+        lv_color_t apColor;
+        if (ap.rssi > -50) {
+            apColor = color_green;
+        } else if (ap.rssi > -70) {
+            apColor = color_yellow;
+        } else if (ap.rssi > -85) {
+            apColor = color_orange;
+        } else {
+            apColor = color_red;
+        }
+
+        // Draw AP with size based on signal strength
+        int size = map(ap.rssi, -100, -30, 2, 12);
+
+        // Draw glow effect
+        rect_dsc.bg_opa = LV_OPA_30;
+        rect_dsc.bg_color = apColor;
+        rect_dsc.radius = size * 2;
+        lv_area_t area;
+        area.x1 = x - size * 2;
+        area.y1 = y - size * 2;
+        area.x2 = x + size * 2;
+        area.y2 = y + size * 2;
+        lv_canvas_draw_rect(radar_canvas, area.x1, area.y1,
+                           area.x2 - area.x1, area.y2 - area.y1, &rect_dsc);
+
+        // Draw AP center
+        rect_dsc.bg_opa = LV_OPA_COVER;
+        rect_dsc.radius = size;
+        area.x1 = x - size;
+        area.y1 = y - size;
+        area.x2 = x + size;
+        area.y2 = y + size;
+        lv_canvas_draw_rect(radar_canvas, area.x1, area.y1,
+                           area.x2 - area.x1, area.y2 - area.y1, &rect_dsc);
+
+        // Draw SSID label for strong signals
+        if (ap.rssi > -70 && ap.ssid.length() > 0) {
+            label_dsc.color = color_cyan;
+            lv_canvas_draw_text(radar_canvas, x + size + 2, y - 5, 100,
+                               &label_dsc, ap.ssid.c_str());
+        }
+
+        // Add to radar trail
+        int angleIdx = (int)ap.angle % 360;
+        int distIdx = min((int)distancePixels, RADAR_RADIUS - 1);
+        radarTrail[angleIdx][distIdx] = 255;
+    }
+
+    // Draw stations if in promiscuous mode
+    if (promiscuousMode) {
+        rect_dsc.radius = 2;
+        rect_dsc.bg_color = color_cyan;
+        rect_dsc.bg_opa = LV_OPA_70;
+
+        for (auto& station : wifiStations) {
+            if (!station.isActive) continue;
+            if (millis() - station.lastSeen > 5000) {
+                station.isActive = false;
+                continue;
+            }
+
+            float angle = random(0, 360);
+            float distancePixels = map(station.distance, 0, scanRange, 0, RADAR_RADIUS);
+            int x = RADAR_RADIUS + cos(angle * PI / 180.0) * distancePixels;
+            int y = RADAR_RADIUS - sin(angle * PI / 180.0) * distancePixels;
+
+            lv_area_t area;
+            area.x1 = x - 2;
+            area.y1 = y - 2;
+            area.x2 = x + 2;
+            area.y2 = y + 2;
+            lv_canvas_draw_rect(radar_canvas, area.x1, area.y1, 4, 4, &rect_dsc);
+        }
+    }
+
+    // Draw radar trail/persistence
+    rect_dsc.bg_opa = LV_OPA_COVER;
+    rect_dsc.radius = 0;
+
+    for (int a = 0; a < 360; a++) {
+        for (int r = 0; r < RADAR_RADIUS; r++) {
+            if (radarTrail[a][r] > 0) {
+                float rad = a * PI / 180.0;
+                int x = RADAR_RADIUS + cos(rad) * r;
+                int y = RADAR_RADIUS - sin(rad) * r;
+
+                rect_dsc.bg_color = lv_color_mix(color_green, color_dark, radarTrail[a][r]);
+                lv_area_t area;
+                area.x1 = x;
+                area.y1 = y;
+                area.x2 = x + 1;
+                area.y2 = y + 1;
+                lv_canvas_draw_rect(radar_canvas, area.x1, area.y1, 1, 1, &rect_dsc);
+
+                // Fade trail
+                radarTrail[a][r] = max(0, radarTrail[a][r] - 3);
+            }
+        }
+    }
+}
+
+// Draw Spectrum Analyzer
+void drawSpectrum() {
+    static lv_color_t *buf = nullptr;
+    if (!buf) {
+        buf = (lv_color_t*)ps_malloc(SPECTRUM_WIDTH * SPECTRUM_HEIGHT * sizeof(lv_color_t));
+        if (!buf) return;
+    }
+    lv_canvas_set_buffer(spectrum_canvas, buf, SPECTRUM_WIDTH, SPECTRUM_HEIGHT, LV_IMG_CF_TRUE_COLOR);
+
+    // Clear canvas
+    lv_canvas_fill_bg(spectrum_canvas, color_dark, LV_OPA_COVER);
+
+    // Draw grid
+    lv_draw_line_dsc_t line_dsc;
+    lv_draw_line_dsc_init(&line_dsc);
+    line_dsc.color = LV_COLOR_MAKE(0x20, 0x20, 0x20);
+    line_dsc.width = 1;
+
+    lv_point_t line_points[2];
+
+    // Horizontal grid lines (RSSI levels)
+    for (int i = 0; i <= 5; i++) {
+        int y = i * SPECTRUM_HEIGHT / 5;
+        line_points[0].x = 0;
+        line_points[0].y = y;
+        line_points[1].x = SPECTRUM_WIDTH;
+        line_points[1].y = y;
+        lv_canvas_draw_line(spectrum_canvas, line_points, 2, &line_dsc);
+    }
+
+    // Draw channels
+    int channelWidth = SPECTRUM_WIDTH / 14;
+
+    for (int ch = 1; ch <= 14; ch++) {
+        int x = (ch - 1) * channelWidth;
+
+        // Channel separator
+        line_points[0].x = x;
+        line_points[0].y = 0;
+        line_points[1].x = x;
+        line_points[1].y = SPECTRUM_HEIGHT;
+        lv_canvas_draw_line(spectrum_canvas, line_points, 2, &line_dsc);
+
+        // Draw channel utilization bar
+        float utilization = channels[ch].utilization;
+        float interference = channels[ch].interference;
+
+        lv_draw_rect_dsc_t rect_dsc;
+        lv_draw_rect_dsc_init(&rect_dsc);
+
+        // Background bar (interference)
+        int interferenceHeight = (interference / 10.0) * SPECTRUM_HEIGHT;
+        rect_dsc.bg_color = color_red;
+        rect_dsc.bg_opa = LV_OPA_30;
+
+        lv_area_t area;
+        area.x1 = x + 2;
+        area.y1 = SPECTRUM_HEIGHT - interferenceHeight;
+        area.x2 = x + channelWidth - 2;
+        area.y2 = SPECTRUM_HEIGHT;
+        lv_canvas_draw_rect(spectrum_canvas, area.x1, area.y1,
+                           area.x2 - area.x1, area.y2 - area.y1, &rect_dsc);
+
+        // Draw each AP in this channel
+        int apOffset = 0;
+        for (auto& pair : wifiNetworks) {
+            WiFiAP& ap = pair.second;
+            if (ap.channel != ch) continue;
+            if (millis() - ap.lastSeen > 10000) continue;
+
+            // Calculate bar height based on RSSI
+            int height = map(ap.rssi, -100, -30, 5, SPECTRUM_HEIGHT - 10);
+            int barWidth = (channelWidth - 4) / max(1, channels[ch].apCount);
+            int barX = x + 2 + (apOffset * barWidth);
+
+            // Choose color based on encryption
+            if (ap.encryption == WIFI_AUTH_OPEN) {
+                rect_dsc.bg_color = color_green;
+            } else if (ap.encryption == WIFI_AUTH_WPA2_PSK) {
+                rect_dsc.bg_color = color_blue;
+            } else {
+                rect_dsc.bg_color = color_orange;
+            }
+
+            rect_dsc.bg_opa = LV_OPA_80;
+
+            area.x1 = barX;
+            area.y1 = SPECTRUM_HEIGHT - height;
+            area.x2 = barX + barWidth - 1;
+            area.y2 = SPECTRUM_HEIGHT;
+            lv_canvas_draw_rect(spectrum_canvas, area.x1, area.y1,
+                               area.x2 - area.x1, area.y2 - area.y1, &rect_dsc);
+
+            apOffset++;
+        }
+
+        // Draw channel number
+        lv_draw_label_dsc_t label_dsc;
+        lv_draw_label_dsc_init(&label_dsc);
+        label_dsc.color = color_cyan;
+
+        char chStr[4];
+        snprintf(chStr, sizeof(chStr), "%d", ch);
+        lv_canvas_draw_text(spectrum_canvas, x + channelWidth/2 - 5,
+                           SPECTRUM_HEIGHT - 15, 20, &label_dsc, chStr);
+    }
+}
+
+// Update display information
+void updateDisplay(lv_timer_t *timer) {
+    // Count active networks and stations
+    int activeNetworks = 0;
+    int activeStations = 0;
+    WiFiAP* strongest = nullptr;
+    WiFiAP* weakest = nullptr;
+
+    for (auto& pair : wifiNetworks) {
+        WiFiAP& ap = pair.second;
+        if (millis() - ap.lastSeen < 10000) {
+            activeNetworks++;
+            if (!strongest || ap.rssi > strongest->rssi) {
+                strongest = &ap;
+            }
+            if (!weakest || ap.rssi < weakest->rssi) {
+                weakest = &ap;
+            }
+        }
+    }
+
+    for (auto& station : wifiStations) {
+        if (station.isActive) {
+            activeStations++;
+        }
+    }
+
+    // Update labels
+    lv_label_set_text_fmt(network_count_label, "Networks: %d", activeNetworks);
+    lv_label_set_text_fmt(station_count_label, "Stations: %d", activeStations);
+    lv_label_set_text_fmt(channel_label, "Channel: %d", currentChannel);
+
+    if (strongest) {
+        lv_label_set_text_fmt(strongest_label, "Strongest: %s (%d dBm)",
+                             strongest->ssid.c_str(), strongest->rssi);
+    }
+
+    if (weakest) {
+        lv_label_set_text_fmt(weakest_label, "Weakest: %s (%d dBm)",
+                             weakest->ssid.c_str(), weakest->rssi);
+    }
+
+    // Calculate overall interference
+    float totalInterference = 0;
+    for (int ch = 1; ch <= MAX_CHANNELS; ch++) {
+        totalInterference += channels[ch].interference;
+    }
+    lv_label_set_text_fmt(interference_label, "Interference: %.1f%%",
+                         totalInterference / MAX_CHANNELS);
+
+    // Update scan status
+    if (isScanning) {
+        lv_label_set_text(scan_status_label, "SCANNING...");
+        lv_obj_set_style_text_color(scan_status_label, color_yellow, 0);
+    } else {
+        lv_label_set_text(scan_status_label, "IDLE");
+        lv_obj_set_style_text_color(scan_status_label, color_green, 0);
+    }
+
+    // Update network list
+    lv_obj_clean(network_list);
+    int listCount = 0;
+
+    for (auto& pair : wifiNetworks) {
+        WiFiAP& ap = pair.second;
+        if (millis() - ap.lastSeen > 10000) continue;
+        if (listCount >= 10) break;  // Limit list size
+
+        lv_obj_t *item = lv_label_create(network_list);
+        char itemText[100];
+        snprintf(itemText, sizeof(itemText), "%-20s CH:%-2d %4d dBm %.1fm %s",
+                ap.ssid.length() > 0 ? ap.ssid.c_str() : "[Hidden]",
+                ap.channel, ap.rssi, ap.distance,
+                ap.isMoving ? "📶" : "📍");
+
+        lv_label_set_text(item, itemText);
+        lv_obj_set_style_text_font(item, &lv_font_montserrat_14, 0);
+
+        // Color based on signal
+        if (ap.rssi > -50) {
+            lv_obj_set_style_text_color(item, color_green, 0);
+        } else if (ap.rssi > -70) {
+            lv_obj_set_style_text_color(item, color_yellow, 0);
+        } else {
+            lv_obj_set_style_text_color(item, color_orange, 0);
+        }
+
+        lv_obj_align(item, LV_ALIGN_TOP_LEFT, 5, 5 + listCount * 18);
+        listCount++;
+    }
+
+    // Update RSSI chart
+    static int chartCounter = 0;
+    if (chartCounter++ % 5 == 0) {  // Update every 5th call
+        int seriesIdx = 0;
+        for (auto& pair : wifiNetworks) {
+            if (seriesIdx >= 5) break;
+            WiFiAP& ap = pair.second;
+            if (millis() - ap.lastSeen < 10000) {
+                lv_chart_set_next_value(network_chart, rssi_series[seriesIdx],
+                                       100 + ap.rssi);
+                seriesIdx++;
+            }
+        }
+    }
+}
 
 // Touch event handlers
-static void gear_select_event_cb(lv_event_t *e) {
-    lv_obj_t *btn = lv_event_get_target(e);
-    const char *txt = lv_label_get_text(lv_obj_get_child(btn, 0));
-    vehicle.gear = txt[0];
-
-    // Update visual feedback
-    lv_obj_set_style_bg_color(park_btn, vehicle.gear == 'P' ? color_tesla_blue : color_gray, 0);
-    lv_obj_set_style_bg_color(reverse_btn, vehicle.gear == 'R' ? color_tesla_blue : color_gray, 0);
-    lv_obj_set_style_bg_color(neutral_btn, vehicle.gear == 'N' ? color_tesla_blue : color_gray, 0);
-    lv_obj_set_style_bg_color(drive_btn, vehicle.gear == 'D' ? color_tesla_blue : color_gray, 0);
-
-    lv_label_set_text_fmt(gear_selector, "%c", vehicle.gear);
+static void scan_btn_event_cb(lv_event_t *e) {
+    scanNetworks();
 }
 
-static void autopilot_event_cb(lv_event_t *e) {
-    vehicle.autopilot_enabled = !vehicle.autopilot_enabled;
-    lv_obj_t *btn = lv_event_get_target(e);
-    lv_obj_set_style_bg_color(btn,
-        vehicle.autopilot_enabled ? color_tesla_blue : color_gray, 0);
-    lv_label_set_text(lv_obj_get_child(btn, 0),
-        vehicle.autopilot_enabled ? "AUTOPILOT ON" : "AUTOPILOT OFF");
-}
+static void promiscuous_btn_event_cb(lv_event_t *e) {
+    promiscuousMode = !promiscuousMode;
 
-static void climate_slider_event_cb(lv_event_t *e) {
-    lv_obj_t *slider = lv_event_get_target(e);
-    vehicle.climate_temp = lv_slider_get_value(slider);
-    lv_label_set_text_fmt(temp_label, "%d°C", vehicle.climate_temp);
-}
-
-static void volume_slider_event_cb(lv_event_t *e) {
-    lv_obj_t *slider = lv_event_get_target(e);
-    vehicle.volume = lv_slider_get_value(slider);
-}
-
-static void brightness_slider_event_cb(lv_event_t *e) {
-    lv_obj_t *slider = lv_event_get_target(e);
-    vehicle.brightness = lv_slider_get_value(slider);
-    // In real implementation, this would control display brightness
-}
-
-static void turn_signal_event_cb(lv_event_t *e) {
-    lv_obj_t *btn = lv_event_get_target(e);
-    if (btn == left_turn_signal) {
-        vehicle.left_signal = !vehicle.left_signal;
-        vehicle.right_signal = false;
+    if (promiscuousMode) {
+        // Enable promiscuous mode
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
+        lv_label_set_text(lv_obj_get_child(promiscuous_btn, 0), "PROMISCUOUS ON");
+        lv_obj_set_style_bg_color(promiscuous_btn, color_red, 0);
     } else {
-        vehicle.right_signal = !vehicle.right_signal;
-        vehicle.left_signal = false;
+        // Disable promiscuous mode
+        esp_wifi_set_promiscuous(false);
+        lv_label_set_text(lv_obj_get_child(promiscuous_btn, 0), "PROMISCUOUS OFF");
+        lv_obj_set_style_bg_color(promiscuous_btn, LV_COLOR_MAKE(0x40, 0x40, 0x40), 0);
     }
 }
 
-// Update dashboard display
-static void update_dashboard(lv_timer_t *timer) {
-    static int counter = 0;
-    counter++;
+static void channel_slider_event_cb(lv_event_t *e) {
+    lv_obj_t *slider = lv_event_get_target(e);
+    currentChannel = lv_slider_get_value(slider);
 
-    // Simulate speed changes
-    if (vehicle.gear == 'D') {
-        if (vehicle.speed < 120) vehicle.speed += random(0, 5);
-    } else if (vehicle.gear == 'R') {
-        if (vehicle.speed > -20) vehicle.speed -= 1;
-    } else {
-        if (vehicle.speed > 0) vehicle.speed -= 2;
-        if (vehicle.speed < 0) vehicle.speed += 1;
+    // Set WiFi channel
+    if (promiscuousMode) {
+        esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
     }
-
-    // Update speed display
-    lv_label_set_text_fmt(speed_label, "%d", abs(vehicle.speed));
-
-    // Update power meter (simulate based on speed change)
-    vehicle.power = random(-50, 150);
-    lv_bar_set_value(power_meter, 100 + vehicle.power, LV_ANIM_ON);
-
-    // Update battery (slow drain simulation)
-    if (counter % 100 == 0 && vehicle.battery_percent > 20) {
-        vehicle.battery_percent--;
-        vehicle.range_km = vehicle.battery_percent * 4.5;
-    }
-
-    lv_bar_set_value(battery_bar, vehicle.battery_percent, LV_ANIM_ON);
-    lv_label_set_text_fmt(battery_label, "%d%%", vehicle.battery_percent);
-    lv_label_set_text_fmt(range_label, "%d km", vehicle.range_km);
-
-    // Update charts
-    lv_chart_set_next_value(power_chart, power_series, vehicle.power);
-    lv_chart_set_next_value(power_chart, regen_series, vehicle.power < 0 ? -vehicle.power : 0);
-
-    // Turn signal blinking
-    if (counter % 10 == 0) {
-        if (vehicle.left_signal) {
-            static bool blink = false;
-            blink = !blink;
-            lv_obj_set_style_bg_opa(left_turn_signal, blink ? LV_OPA_100 : LV_OPA_30, 0);
-        } else {
-            lv_obj_set_style_bg_opa(left_turn_signal, LV_OPA_30, 0);
-        }
-
-        if (vehicle.right_signal) {
-            static bool blink = false;
-            blink = !blink;
-            lv_obj_set_style_bg_opa(right_turn_signal, blink ? LV_OPA_100 : LV_OPA_30, 0);
-        } else {
-            lv_obj_set_style_bg_opa(right_turn_signal, LV_OPA_30, 0);
-        }
-    }
-
-    // Update time
-    unsigned long seconds = millis() / 1000;
-    int hours = (seconds / 3600) % 24;
-    int minutes = (seconds / 60) % 60;
-    lv_label_set_text_fmt(time_label, "%02d:%02d", hours, minutes);
 }
 
-// Create Tesla-style dashboard UI
-void create_tesla_dashboard() {
+static void range_slider_event_cb(lv_event_t *e) {
+    lv_obj_t *slider = lv_event_get_target(e);
+    scanRange = lv_slider_get_value(slider);
+}
+
+static void sensitivity_slider_event_cb(lv_event_t *e) {
+    lv_obj_t *slider = lv_event_get_target(e);
+    sensitivity = -lv_slider_get_value(slider);
+}
+
+static void view_selector_event_cb(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_target(e);
+    viewMode = lv_btnmatrix_get_selected_btn(btn);
+
+    // Show/hide canvases based on view
+    lv_obj_add_flag(radar_canvas, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(spectrum_canvas, LV_OBJ_FLAG_HIDDEN);
+
+    switch(viewMode) {
+        case 0:  // Radar
+            lv_obj_clear_flag(radar_canvas, LV_OBJ_FLAG_HIDDEN);
+            break;
+        case 1:  // Spectrum
+            lv_obj_clear_flag(spectrum_canvas, LV_OBJ_FLAG_HIDDEN);
+            break;
+    }
+}
+
+// Periodic scan timer
+void scan_timer_cb(lv_timer_t *timer) {
+    if (!isScanning && WiFi.getMode() != WIFI_MODE_NULL) {
+        scanNetworks();
+    }
+}
+
+// Create UI
+void createWiFiLidarUI() {
     scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, color_dark, 0);
 
-    // Top status bar
-    lv_obj_t *top_bar = lv_obj_create(scr);
-    lv_obj_set_size(top_bar, 800, 40);
-    lv_obj_align(top_bar, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(top_bar, LV_COLOR_MAKE(0x10, 0x10, 0x10), 0);
-    lv_obj_set_style_border_width(top_bar, 0, 0);
-    lv_obj_clear_flag(top_bar, LV_OBJ_FLAG_SCROLLABLE);
+    // Title bar
+    lv_obj_t *title_bar = lv_obj_create(scr);
+    lv_obj_set_size(title_bar, 800, 35);
+    lv_obj_align(title_bar, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(title_bar, LV_COLOR_MAKE(0x10, 0x10, 0x10), 0);
+    lv_obj_set_style_border_width(title_bar, 0, 0);
+    lv_obj_clear_flag(title_bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Tesla logo/brand
-    lv_obj_t *brand = lv_label_create(top_bar);
-    lv_label_set_text(brand, "TESLA");
-    lv_obj_set_style_text_font(brand, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(brand, color_tesla_red, 0);
-    lv_obj_align(brand, LV_ALIGN_LEFT_MID, 10, 0);
+    lv_obj_t *title = lv_label_create(title_bar);
+    lv_label_set_text(title, "WiFi LiDAR - Professional Environmental Scanner");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, color_cyan, 0);
+    lv_obj_align(title, LV_ALIGN_LEFT_MID, 10, 0);
 
-    // Time display
-    time_label = lv_label_create(top_bar);
-    lv_label_set_text(time_label, "00:00");
-    lv_obj_set_style_text_color(time_label, color_white, 0);
-    lv_obj_align(time_label, LV_ALIGN_CENTER, 0, 0);
+    mode_label = lv_label_create(title_bar);
+    lv_label_set_text(mode_label, "RADAR MODE");
+    lv_obj_set_style_text_color(mode_label, color_green, 0);
+    lv_obj_align(mode_label, LV_ALIGN_RIGHT_MID, -10, 0);
 
-    // Temperature
-    temp_label = lv_label_create(top_bar);
-    lv_label_set_text_fmt(temp_label, "%d°C", vehicle.temp_outside);
-    lv_obj_set_style_text_color(temp_label, color_white, 0);
-    lv_obj_align(temp_label, LV_ALIGN_RIGHT_MID, -10, 0);
+    // Main display area
+    lv_obj_t *display_container = lv_obj_create(scr);
+    lv_obj_set_size(display_container, 480, 380);
+    lv_obj_align(display_container, LV_ALIGN_TOP_LEFT, 5, 40);
+    lv_obj_set_style_bg_color(display_container, LV_COLOR_MAKE(0x05, 0x05, 0x05), 0);
+    lv_obj_set_style_border_color(display_container, color_green, 0);
+    lv_obj_set_style_border_width(display_container, 1, 0);
+    lv_obj_clear_flag(display_container, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Main dashboard container
-    lv_obj_t *main_container = lv_obj_create(scr);
-    lv_obj_set_size(main_container, 800, 340);
-    lv_obj_align(main_container, LV_ALIGN_TOP_MID, 0, 45);
-    lv_obj_set_style_bg_color(main_container, color_dark, 0);
-    lv_obj_set_style_border_width(main_container, 0, 0);
-    lv_obj_clear_flag(main_container, LV_OBJ_FLAG_SCROLLABLE);
+    // Radar canvas
+    radar_canvas = lv_canvas_create(display_container);
+    lv_obj_set_size(radar_canvas, RADAR_RADIUS * 2, RADAR_RADIUS * 2);
+    lv_obj_center(radar_canvas);
 
-    // Center speed display
-    center_panel = lv_obj_create(main_container);
-    lv_obj_set_size(center_panel, 300, 280);
-    lv_obj_align(center_panel, LV_ALIGN_CENTER, 0, -20);
-    lv_obj_set_style_bg_color(center_panel, LV_COLOR_MAKE(0x15, 0x15, 0x15), 0);
-    lv_obj_set_style_border_width(center_panel, 2, 0);
-    lv_obj_set_style_border_color(center_panel, color_gray, 0);
-    lv_obj_set_style_radius(center_panel, 15, 0);
-    lv_obj_clear_flag(center_panel, LV_OBJ_FLAG_SCROLLABLE);
+    // Spectrum canvas (initially hidden)
+    spectrum_canvas = lv_canvas_create(display_container);
+    lv_obj_set_size(spectrum_canvas, 460, SPECTRUM_HEIGHT);
+    lv_obj_align(spectrum_canvas, LV_ALIGN_CENTER, 0, -50);
+    lv_obj_add_flag(spectrum_canvas, LV_OBJ_FLAG_HIDDEN);
 
-    // Speed display
-    speed_label = lv_label_create(center_panel);
-    lv_label_set_text(speed_label, "0");
-    lv_obj_set_style_text_font(speed_label, &lv_font_montserrat_48, 0);
-    lv_obj_set_style_text_color(speed_label, color_white, 0);
-    lv_obj_align(speed_label, LV_ALIGN_CENTER, 0, -20);
+    // Info panel
+    info_panel = lv_obj_create(scr);
+    lv_obj_set_size(info_panel, 305, 180);
+    lv_obj_align(info_panel, LV_ALIGN_TOP_RIGHT, -5, 40);
+    lv_obj_set_style_bg_color(info_panel, LV_COLOR_MAKE(0x08, 0x08, 0x08), 0);
+    lv_obj_set_style_border_color(info_panel, color_blue, 0);
+    lv_obj_set_style_border_width(info_panel, 1, 0);
+    lv_obj_clear_flag(info_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    speed_unit_label = lv_label_create(center_panel);
-    lv_label_set_text(speed_unit_label, "km/h");
-    lv_obj_set_style_text_color(speed_unit_label, color_gray, 0);
-    lv_obj_align(speed_unit_label, LV_ALIGN_CENTER, 0, 20);
+    // Info labels
+    network_count_label = lv_label_create(info_panel);
+    lv_label_set_text(network_count_label, "Networks: 0");
+    lv_obj_set_style_text_color(network_count_label, color_cyan, 0);
+    lv_obj_align(network_count_label, LV_ALIGN_TOP_LEFT, 10, 10);
 
-    // Gear selector display
-    gear_selector = lv_label_create(center_panel);
-    lv_label_set_text_fmt(gear_selector, "%c", vehicle.gear);
-    lv_obj_set_style_text_font(gear_selector, &lv_font_montserrat_30, 0);
-    lv_obj_set_style_text_color(gear_selector, color_tesla_blue, 0);
-    lv_obj_align(gear_selector, LV_ALIGN_TOP_MID, 0, 10);
+    station_count_label = lv_label_create(info_panel);
+    lv_label_set_text(station_count_label, "Stations: 0");
+    lv_obj_set_style_text_color(station_count_label, color_cyan, 0);
+    lv_obj_align(station_count_label, LV_ALIGN_TOP_LEFT, 10, 30);
 
-    // Autopilot indicator
-    lv_obj_t *autopilot_status = lv_obj_create(center_panel);
-    lv_obj_set_size(autopilot_status, 120, 30);
-    lv_obj_align(autopilot_status, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(autopilot_status, color_gray, 0);
-    lv_obj_set_style_radius(autopilot_status, 15, 0);
-    lv_obj_clear_flag(autopilot_status, LV_OBJ_FLAG_SCROLLABLE);
+    channel_label = lv_label_create(info_panel);
+    lv_label_set_text(channel_label, "Channel: 1");
+    lv_obj_set_style_text_color(channel_label, color_cyan, 0);
+    lv_obj_align(channel_label, LV_ALIGN_TOP_LEFT, 10, 50);
 
-    lv_obj_t *ap_label = lv_label_create(autopilot_status);
-    lv_label_set_text(ap_label, "AUTOPILOT");
-    lv_obj_set_style_text_font(ap_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ap_label, color_white, 0);
-    lv_obj_center(ap_label);
+    strongest_label = lv_label_create(info_panel);
+    lv_label_set_text(strongest_label, "Strongest: ---");
+    lv_obj_set_style_text_font(strongest_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(strongest_label, color_green, 0);
+    lv_obj_align(strongest_label, LV_ALIGN_TOP_LEFT, 10, 70);
 
-    // Left panel - Power meter
-    left_panel = lv_obj_create(main_container);
-    lv_obj_set_size(left_panel, 200, 280);
-    lv_obj_align(left_panel, LV_ALIGN_LEFT_MID, 10, -20);
-    lv_obj_set_style_bg_color(left_panel, LV_COLOR_MAKE(0x15, 0x15, 0x15), 0);
-    lv_obj_set_style_border_width(left_panel, 2, 0);
-    lv_obj_set_style_border_color(left_panel, color_gray, 0);
-    lv_obj_set_style_radius(left_panel, 15, 0);
-    lv_obj_clear_flag(left_panel, LV_OBJ_FLAG_SCROLLABLE);
+    weakest_label = lv_label_create(info_panel);
+    lv_label_set_text(weakest_label, "Weakest: ---");
+    lv_obj_set_style_text_font(weakest_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(weakest_label, color_red, 0);
+    lv_obj_align(weakest_label, LV_ALIGN_TOP_LEFT, 10, 90);
 
-    lv_obj_t *power_title = lv_label_create(left_panel);
-    lv_label_set_text(power_title, "POWER");
-    lv_obj_set_style_text_color(power_title, color_white, 0);
-    lv_obj_align(power_title, LV_ALIGN_TOP_MID, 0, 10);
+    interference_label = lv_label_create(info_panel);
+    lv_label_set_text(interference_label, "Interference: 0%");
+    lv_obj_set_style_text_color(interference_label, color_orange, 0);
+    lv_obj_align(interference_label, LV_ALIGN_TOP_LEFT, 10, 110);
 
-    // Power meter bar
-    power_meter = lv_bar_create(left_panel);
-    lv_obj_set_size(power_meter, 160, 30);
-    lv_obj_align(power_meter, LV_ALIGN_TOP_MID, 0, 40);
-    lv_bar_set_range(power_meter, 0, 200);
-    lv_bar_set_value(power_meter, 100, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(power_meter, color_gray, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(power_meter, color_green, LV_PART_INDICATOR);
+    scan_status_label = lv_label_create(info_panel);
+    lv_label_set_text(scan_status_label, "INITIALIZING...");
+    lv_obj_set_style_text_color(scan_status_label, color_yellow, 0);
+    lv_obj_align(scan_status_label, LV_ALIGN_TOP_LEFT, 10, 130);
 
-    // Power chart
-    power_chart = lv_chart_create(left_panel);
-    lv_obj_set_size(power_chart, 180, 100);
-    lv_obj_align(power_chart, LV_ALIGN_CENTER, 0, 20);
-    lv_chart_set_type(power_chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(power_chart, 50);
-    lv_chart_set_range(power_chart, LV_CHART_AXIS_PRIMARY_Y, -100, 200);
-    lv_obj_set_style_bg_opa(power_chart, LV_OPA_20, 0);
+    // RSSI Chart
+    network_chart = lv_chart_create(info_panel);
+    lv_obj_set_size(network_chart, 140, 60);
+    lv_obj_align(network_chart, LV_ALIGN_TOP_RIGHT, -10, 10);
+    lv_chart_set_type(network_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(network_chart, 30);
+    lv_chart_set_range(network_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+    lv_obj_set_style_bg_opa(network_chart, LV_OPA_20, 0);
 
-    power_series = lv_chart_add_series(power_chart, color_green, LV_CHART_AXIS_PRIMARY_Y);
-    regen_series = lv_chart_add_series(power_chart, color_orange, LV_CHART_AXIS_PRIMARY_Y);
+    for (int i = 0; i < 5; i++) {
+        rssi_series[i] = lv_chart_add_series(network_chart,
+            lv_color_hsv_to_rgb(i * 60, 100, 100), LV_CHART_AXIS_PRIMARY_Y);
+    }
 
-    // Turn signals
-    left_turn_signal = lv_btn_create(left_panel);
-    lv_obj_set_size(left_turn_signal, 40, 40);
-    lv_obj_align(left_turn_signal, LV_ALIGN_BOTTOM_LEFT, 10, -10);
-    lv_obj_set_style_bg_color(left_turn_signal, color_green, 0);
-    lv_obj_add_event_cb(left_turn_signal, turn_signal_event_cb, LV_EVENT_CLICKED, NULL);
+    // Network list
+    network_list = lv_obj_create(scr);
+    lv_obj_set_size(network_list, 305, 195);
+    lv_obj_align(network_list, LV_ALIGN_TOP_RIGHT, -5, 225);
+    lv_obj_set_style_bg_color(network_list, LV_COLOR_MAKE(0x08, 0x08, 0x08), 0);
+    lv_obj_set_style_border_color(network_list, color_purple, 0);
+    lv_obj_set_style_border_width(network_list, 1, 0);
 
-    lv_obj_t *left_arrow = lv_label_create(left_turn_signal);
-    lv_label_set_text(left_arrow, LV_SYMBOL_LEFT);
-    lv_obj_center(left_arrow);
+    // Control panel
+    control_panel = lv_obj_create(scr);
+    lv_obj_set_size(control_panel, 480, 55);
+    lv_obj_align(control_panel, LV_ALIGN_BOTTOM_LEFT, 5, -5);
+    lv_obj_set_style_bg_color(control_panel, LV_COLOR_MAKE(0x10, 0x10, 0x10), 0);
+    lv_obj_set_style_border_color(control_panel, LV_COLOR_MAKE(0x30, 0x30, 0x30), 0);
+    lv_obj_set_style_border_width(control_panel, 1, 0);
+    lv_obj_clear_flag(control_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Right panel - Battery & Range
-    right_panel = lv_obj_create(main_container);
-    lv_obj_set_size(right_panel, 200, 280);
-    lv_obj_align(right_panel, LV_ALIGN_RIGHT_MID, -10, -20);
-    lv_obj_set_style_bg_color(right_panel, LV_COLOR_MAKE(0x15, 0x15, 0x15), 0);
-    lv_obj_set_style_border_width(right_panel, 2, 0);
-    lv_obj_set_style_border_color(right_panel, color_gray, 0);
-    lv_obj_set_style_radius(right_panel, 15, 0);
-    lv_obj_clear_flag(right_panel, LV_OBJ_FLAG_SCROLLABLE);
+    // Scan button
+    scan_btn = lv_btn_create(control_panel);
+    lv_obj_set_size(scan_btn, 70, 40);
+    lv_obj_align(scan_btn, LV_ALIGN_LEFT_MID, 10, 0);
+    lv_obj_set_style_bg_color(scan_btn, color_green, 0);
+    lv_obj_add_event_cb(scan_btn, scan_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *battery_title = lv_label_create(right_panel);
-    lv_label_set_text(battery_title, "BATTERY");
-    lv_obj_set_style_text_color(battery_title, color_white, 0);
-    lv_obj_align(battery_title, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_t *scan_label = lv_label_create(scan_btn);
+    lv_label_set_text(scan_label, "SCAN");
+    lv_obj_center(scan_label);
 
-    // Battery visualization
-    battery_container = lv_obj_create(right_panel);
-    lv_obj_set_size(battery_container, 160, 80);
-    lv_obj_align(battery_container, LV_ALIGN_TOP_MID, 0, 40);
-    lv_obj_set_style_bg_color(battery_container, color_gray, 0);
-    lv_obj_set_style_radius(battery_container, 10, 0);
-    lv_obj_clear_flag(battery_container, LV_OBJ_FLAG_SCROLLABLE);
+    // Promiscuous button
+    promiscuous_btn = lv_btn_create(control_panel);
+    lv_obj_set_size(promiscuous_btn, 110, 40);
+    lv_obj_align(promiscuous_btn, LV_ALIGN_LEFT_MID, 85, 0);
+    lv_obj_set_style_bg_color(promiscuous_btn, LV_COLOR_MAKE(0x40, 0x40, 0x40), 0);
+    lv_obj_add_event_cb(promiscuous_btn, promiscuous_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
-    battery_bar = lv_bar_create(battery_container);
-    lv_obj_set_size(battery_bar, 140, 60);
-    lv_obj_center(battery_bar);
-    lv_bar_set_range(battery_bar, 0, 100);
-    lv_bar_set_value(battery_bar, vehicle.battery_percent, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(battery_bar, LV_COLOR_MAKE(0x30, 0x30, 0x30), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(battery_bar, color_green, LV_PART_INDICATOR);
+    lv_obj_t *prom_label = lv_label_create(promiscuous_btn);
+    lv_label_set_text(prom_label, "PROMISCUOUS OFF");
+    lv_obj_set_style_text_font(prom_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(prom_label);
 
-    battery_label = lv_label_create(battery_container);
-    lv_label_set_text_fmt(battery_label, "%d%%", vehicle.battery_percent);
-    lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(battery_label, color_white, 0);
-    lv_obj_center(battery_label);
+    // Channel slider
+    channel_slider = lv_slider_create(control_panel);
+    lv_obj_set_size(channel_slider, 100, 15);
+    lv_obj_align(channel_slider, LV_ALIGN_LEFT_MID, 205, -10);
+    lv_slider_set_range(channel_slider, 1, 14);
+    lv_slider_set_value(channel_slider, currentChannel, LV_ANIM_OFF);
+    lv_obj_add_event_cb(channel_slider, channel_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    // Range display
-    lv_obj_t *range_title = lv_label_create(right_panel);
-    lv_label_set_text(range_title, "EST. RANGE");
-    lv_obj_set_style_text_color(range_title, color_gray, 0);
-    lv_obj_align(range_title, LV_ALIGN_TOP_MID, 0, 130);
+    lv_obj_t *ch_label = lv_label_create(control_panel);
+    lv_label_set_text(ch_label, "Channel");
+    lv_obj_set_style_text_font(ch_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ch_label, color_cyan, 0);
+    lv_obj_align(ch_label, LV_ALIGN_LEFT_MID, 205, 10);
 
-    range_label = lv_label_create(right_panel);
-    lv_label_set_text_fmt(range_label, "%d km", vehicle.range_km);
-    lv_obj_set_style_text_font(range_label, &lv_font_montserrat_30, 0);
-    lv_obj_set_style_text_color(range_label, color_white, 0);
-    lv_obj_align(range_label, LV_ALIGN_TOP_MID, 0, 150);
+    // Range slider
+    range_slider = lv_slider_create(control_panel);
+    lv_obj_set_size(range_slider, 80, 15);
+    lv_obj_align(range_slider, LV_ALIGN_LEFT_MID, 315, -10);
+    lv_slider_set_range(range_slider, 10, 200);
+    lv_slider_set_value(range_slider, scanRange, LV_ANIM_OFF);
+    lv_obj_add_event_cb(range_slider, range_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    // Turn signal right
-    right_turn_signal = lv_btn_create(right_panel);
-    lv_obj_set_size(right_turn_signal, 40, 40);
-    lv_obj_align(right_turn_signal, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
-    lv_obj_set_style_bg_color(right_turn_signal, color_green, 0);
-    lv_obj_add_event_cb(right_turn_signal, turn_signal_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *range_label = lv_label_create(control_panel);
+    lv_label_set_text(range_label, "Range");
+    lv_obj_set_style_text_font(range_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(range_label, color_cyan, 0);
+    lv_obj_align(range_label, LV_ALIGN_LEFT_MID, 315, 10);
 
-    lv_obj_t *right_arrow = lv_label_create(right_turn_signal);
-    lv_label_set_text(right_arrow, LV_SYMBOL_RIGHT);
-    lv_obj_center(right_arrow);
+    // Sensitivity slider
+    sensitivity_slider = lv_slider_create(control_panel);
+    lv_obj_set_size(sensitivity_slider, 70, 15);
+    lv_obj_align(sensitivity_slider, LV_ALIGN_LEFT_MID, 405, -10);
+    lv_slider_set_range(sensitivity_slider, 50, 100);
+    lv_slider_set_value(sensitivity_slider, abs(sensitivity), LV_ANIM_OFF);
+    lv_obj_add_event_cb(sensitivity_slider, sensitivity_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    // Bottom control panel with touch buttons
-    bottom_panel = lv_obj_create(scr);
-    lv_obj_set_size(bottom_panel, 800, 90);
-    lv_obj_align(bottom_panel, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(bottom_panel, LV_COLOR_MAKE(0x20, 0x20, 0x20), 0);
-    lv_obj_set_style_border_width(bottom_panel, 0, 0);
-    lv_obj_clear_flag(bottom_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *sens_label = lv_label_create(control_panel);
+    lv_label_set_text(sens_label, "Sensitivity");
+    lv_obj_set_style_text_font(sens_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sens_label, color_cyan, 0);
+    lv_obj_align(sens_label, LV_ALIGN_LEFT_MID, 400, 10);
 
-    // Gear selector buttons
-    park_btn = lv_btn_create(bottom_panel);
-    lv_obj_set_size(park_btn, 60, 60);
-    lv_obj_align(park_btn, LV_ALIGN_LEFT_MID, 20, 0);
-    lv_obj_set_style_bg_color(park_btn, vehicle.gear == 'P' ? color_tesla_blue : color_gray, 0);
-    lv_obj_add_event_cb(park_btn, gear_select_event_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *p_label = lv_label_create(park_btn);
-    lv_label_set_text(p_label, "P");
-    lv_obj_set_style_text_font(p_label, &lv_font_montserrat_20, 0);
-    lv_obj_center(p_label);
-
-    reverse_btn = lv_btn_create(bottom_panel);
-    lv_obj_set_size(reverse_btn, 60, 60);
-    lv_obj_align(reverse_btn, LV_ALIGN_LEFT_MID, 90, 0);
-    lv_obj_set_style_bg_color(reverse_btn, color_gray, 0);
-    lv_obj_add_event_cb(reverse_btn, gear_select_event_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *r_label = lv_label_create(reverse_btn);
-    lv_label_set_text(r_label, "R");
-    lv_obj_set_style_text_font(r_label, &lv_font_montserrat_20, 0);
-    lv_obj_center(r_label);
-
-    neutral_btn = lv_btn_create(bottom_panel);
-    lv_obj_set_size(neutral_btn, 60, 60);
-    lv_obj_align(neutral_btn, LV_ALIGN_LEFT_MID, 160, 0);
-    lv_obj_set_style_bg_color(neutral_btn, color_gray, 0);
-    lv_obj_add_event_cb(neutral_btn, gear_select_event_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *n_label = lv_label_create(neutral_btn);
-    lv_label_set_text(n_label, "N");
-    lv_obj_set_style_text_font(n_label, &lv_font_montserrat_20, 0);
-    lv_obj_center(n_label);
-
-    drive_btn = lv_btn_create(bottom_panel);
-    lv_obj_set_size(drive_btn, 60, 60);
-    lv_obj_align(drive_btn, LV_ALIGN_LEFT_MID, 230, 0);
-    lv_obj_set_style_bg_color(drive_btn, color_gray, 0);
-    lv_obj_add_event_cb(drive_btn, gear_select_event_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *d_label = lv_label_create(drive_btn);
-    lv_label_set_text(d_label, "D");
-    lv_obj_set_style_text_font(d_label, &lv_font_montserrat_20, 0);
-    lv_obj_center(d_label);
-
-    // Autopilot button
-    autopilot_btn = lv_btn_create(bottom_panel);
-    lv_obj_set_size(autopilot_btn, 140, 60);
-    lv_obj_align(autopilot_btn, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(autopilot_btn, color_gray, 0);
-    lv_obj_add_event_cb(autopilot_btn, autopilot_event_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *ap_btn_label = lv_label_create(autopilot_btn);
-    lv_label_set_text(ap_btn_label, "AUTOPILOT OFF");
-    lv_obj_center(ap_btn_label);
-
-    // Climate control slider
-    temp_slider = lv_slider_create(bottom_panel);
-    lv_obj_set_size(temp_slider, 120, 20);
-    lv_obj_align(temp_slider, LV_ALIGN_RIGHT_MID, -150, -20);
-    lv_slider_set_range(temp_slider, 16, 28);
-    lv_slider_set_value(temp_slider, vehicle.climate_temp, LV_ANIM_OFF);
-    lv_obj_add_event_cb(temp_slider, climate_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    lv_obj_t *climate_label = lv_label_create(bottom_panel);
-    lv_label_set_text(climate_label, "CLIMATE");
-    lv_obj_set_style_text_font(climate_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(climate_label, color_gray, 0);
-    lv_obj_align(climate_label, LV_ALIGN_RIGHT_MID, -180, 10);
-
-    // Volume slider
-    volume_slider = lv_slider_create(bottom_panel);
-    lv_obj_set_size(volume_slider, 100, 20);
-    lv_obj_align(volume_slider, LV_ALIGN_RIGHT_MID, -20, -20);
-    lv_slider_set_range(volume_slider, 0, 100);
-    lv_slider_set_value(volume_slider, vehicle.volume, LV_ANIM_OFF);
-    lv_obj_add_event_cb(volume_slider, volume_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    lv_obj_t *volume_label = lv_label_create(bottom_panel);
-    lv_label_set_text(volume_label, "VOLUME");
-    lv_obj_set_style_text_font(volume_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(volume_label, color_gray, 0);
-    lv_obj_align(volume_label, LV_ALIGN_RIGHT_MID, -40, 10);
+    // View selector
+    static const char * view_map[] = {"Radar", "Spectrum", ""};
+    view_selector = lv_btnmatrix_create(scr);
+    lv_btnmatrix_set_map(view_selector, view_map);
+    lv_obj_set_size(view_selector, 305, 40);
+    lv_obj_align(view_selector, LV_ALIGN_BOTTOM_RIGHT, -5, -10);
+    lv_btnmatrix_set_btn_ctrl_all(view_selector, LV_BTNMATRIX_CTRL_CHECKABLE);
+    lv_btnmatrix_set_one_checked(view_selector, true);
+    lv_btnmatrix_set_btn_ctrl(view_selector, 0, LV_BTNMATRIX_CTRL_CHECKED);
+    lv_obj_add_event_cb(view_selector, view_selector_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
 void setup() {
     Serial.begin(115200);
     delay(100);
 
-    Serial.println("Tesla-Style Dashboard with Touch Controls");
-    Serial.println("ESP32-S3 7\" Waveshare Touch LCD");
+    Serial.println("Advanced WiFi LiDAR Visualization System");
+    Serial.println("ESP32-S3 7\" Touch LCD");
 
     // Initialize board
-    Serial.println("Initializing display board...");
+    Serial.println("Initializing display...");
     board = new Board();
     board->init();
 
@@ -537,16 +994,27 @@ void setup() {
     Serial.println("Initializing LVGL...");
     lvgl_port_init(board->getLCD(), board->getTouch());
 
-    // Create dashboard UI
-    Serial.println("Creating Tesla dashboard UI...");
+    // Initialize WiFi
+    Serial.println("Initializing WiFi...");
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+
+    // Create UI
+    Serial.println("Creating WiFi LiDAR UI...");
     lvgl_port_lock(-1);
-    create_tesla_dashboard();
+    createWiFiLidarUI();
     lvgl_port_unlock();
 
-    // Create update timer
-    update_timer = lv_timer_create(update_dashboard, 100, NULL);
+    // Create timers
+    scan_timer = lv_timer_create(scan_timer_cb, SCAN_INTERVAL, NULL);
+    update_timer = lv_timer_create(updateDisplay, 200, NULL);
+    animation_timer = lv_timer_create(drawRadar, 50, NULL);
 
-    Serial.println("Dashboard ready! Touch controls enabled.");
+    // Initial scan
+    scanNetworks();
+
+    Serial.println("WiFi LiDAR System Ready!");
 }
 
 void loop() {
