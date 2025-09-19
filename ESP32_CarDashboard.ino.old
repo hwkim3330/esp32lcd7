@@ -1,0 +1,704 @@
+#include <Arduino.h>
+#include <esp_display_panel.hpp>
+#include <lvgl.h>
+#include "lvgl_v8_port.h"
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_wifi_types.h>
+
+using namespace esp_panel::drivers;
+using namespace esp_panel::board;
+
+// WiFi CSI Configuration
+#define WIFI_CHANNEL 6
+#define CSI_DATA_LEN 128
+#define HEART_RATE_BUFFER_SIZE 512
+#define FFT_SIZE 256
+
+// UI Objects
+static lv_obj_t *main_screen;
+static lv_obj_t *speed_label;
+static lv_obj_t *speed_unit_label;
+static lv_obj_t *power_meter;
+static lv_obj_t *power_label;
+static lv_obj_t *battery_bar;
+static lv_obj_t *battery_percent_label;
+static lv_obj_t *range_label;
+static lv_obj_t *gear_label;
+static lv_obj_t *autopilot_indicator;
+static lv_obj_t *left_signal;
+static lv_obj_t *right_signal;
+static lv_obj_t *temp_label;
+static lv_obj_t *time_label;
+static lv_obj_t *speed_arc;
+static lv_obj_t *regen_bar;
+static lv_obj_t *power_bar;
+
+// Heart Rate Monitoring Objects
+static lv_obj_t *heart_panel;
+static lv_obj_t *heart_rate_label;
+static lv_obj_t *heart_icon;
+static lv_obj_t *heart_rate_chart;
+static lv_obj_t *heart_status_label;
+static lv_obj_t *hrv_label;
+static lv_chart_series_t *heart_rate_series;
+
+// CSI Data buffers
+static float csi_amplitude_buffer[HEART_RATE_BUFFER_SIZE];
+static float csi_phase_buffer[HEART_RATE_BUFFER_SIZE];
+static int csi_buffer_index = 0;
+static float heart_rate_history[100];
+static int heart_history_index = 0;
+
+// Animation objects
+static lv_anim_t speed_anim;
+static lv_anim_t power_anim;
+static lv_anim_t heart_beat_anim;
+static lv_timer_t *update_timer;
+static lv_timer_t *csi_timer;
+
+// Vehicle state
+typedef struct {
+    float current_speed;
+    float target_speed;
+    float current_power;
+    float target_power;
+    int battery_percent;
+    int range_km;
+    char gear;
+    bool autopilot_on;
+    bool left_turn_on;
+    bool right_turn_on;
+    int outside_temp;
+    bool regenerating;
+} VehicleState;
+
+// Heart Rate state
+typedef struct {
+    float current_heart_rate;
+    float heart_rate_variability;
+    float signal_quality;
+    bool detecting;
+    unsigned long last_beat_time;
+    float respiratory_rate;
+} HeartRateState;
+
+static VehicleState vehicle = {
+    .current_speed = 0,
+    .target_speed = 0,
+    .current_power = 0,
+    .target_power = 0,
+    .battery_percent = 85,
+    .range_km = 425,
+    .gear = 'D',
+    .autopilot_on = false,
+    .left_turn_on = false,
+    .right_turn_on = false,
+    .outside_temp = 22,
+    .regenerating = false
+};
+
+static HeartRateState heart_state = {
+    .current_heart_rate = 72,
+    .heart_rate_variability = 42,
+    .signal_quality = 0.95,
+    .detecting = false,
+    .last_beat_time = 0,
+    .respiratory_rate = 16
+};
+
+Board *board = NULL;
+
+// Tesla color scheme
+static lv_color_t tesla_blue = LV_COLOR_MAKE(0x00, 0x7A, 0xFF);
+static lv_color_t tesla_green = LV_COLOR_MAKE(0x00, 0xFF, 0x00);
+static lv_color_t tesla_orange = LV_COLOR_MAKE(0xFF, 0x8C, 0x00);
+static lv_color_t tesla_red = LV_COLOR_MAKE(0xFF, 0x00, 0x00);
+static lv_color_t tesla_dark_bg = LV_COLOR_MAKE(0x0A, 0x0A, 0x0A);
+static lv_color_t tesla_panel_bg = LV_COLOR_MAKE(0x1A, 0x1A, 0x1A);
+static lv_color_t tesla_text_primary = LV_COLOR_MAKE(0xFF, 0xFF, 0xFF);
+static lv_color_t tesla_text_secondary = LV_COLOR_MAKE(0xAA, 0xAA, 0xAA);
+static lv_color_t heart_red = LV_COLOR_MAKE(0xE9, 0x1E, 0x63);
+
+// CSI callback function
+void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info) {
+    if (info->rx_ctrl.sig_mode == 1) { // HT (802.11n) mode
+        // Extract amplitude and phase from CSI data
+        int8_t *csi_data = (int8_t *)info->buf;
+
+        float amplitude = 0;
+        float phase = 0;
+
+        // Calculate average amplitude across subcarriers
+        for (int i = 0; i < info->len; i += 2) {
+            float real = csi_data[i];
+            float imag = csi_data[i + 1];
+            amplitude += sqrt(real * real + imag * imag);
+            phase += atan2(imag, real);
+        }
+
+        amplitude /= (info->len / 2);
+        phase /= (info->len / 2);
+
+        // Store in circular buffer
+        csi_amplitude_buffer[csi_buffer_index] = amplitude;
+        csi_phase_buffer[csi_buffer_index] = phase;
+        csi_buffer_index = (csi_buffer_index + 1) % HEART_RATE_BUFFER_SIZE;
+    }
+}
+
+// Signal processing for heart rate extraction
+float extract_heart_rate_from_csi() {
+    // Simple peak detection algorithm
+    // In real implementation, would use FFT and bandpass filter (0.8-3 Hz)
+
+    float mean = 0;
+    for (int i = 0; i < HEART_RATE_BUFFER_SIZE; i++) {
+        mean += csi_amplitude_buffer[i];
+    }
+    mean /= HEART_RATE_BUFFER_SIZE;
+
+    // Count peaks above mean
+    int peak_count = 0;
+    bool above_mean = false;
+
+    for (int i = 1; i < HEART_RATE_BUFFER_SIZE; i++) {
+        if (!above_mean && csi_amplitude_buffer[i] > mean * 1.1) {
+            above_mean = true;
+            peak_count++;
+        } else if (above_mean && csi_amplitude_buffer[i] < mean * 0.9) {
+            above_mean = false;
+        }
+    }
+
+    // Convert peaks to BPM (assuming buffer represents 10 seconds of data)
+    float bpm = (peak_count * 6.0); // peaks per minute
+
+    // Apply moving average filter
+    static float filtered_bpm = 72;
+    filtered_bpm = filtered_bpm * 0.8 + bpm * 0.2;
+
+    // Clamp to realistic range
+    if (filtered_bpm < 40) filtered_bpm = 40;
+    if (filtered_bpm > 180) filtered_bpm = 180;
+
+    return filtered_bpm;
+}
+
+// Initialize WiFi CSI
+void setup_wifi_csi() {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    // Configure CSI
+    wifi_csi_config_t csi_config = {
+        .lltf_en = true,
+        .htltf_en = true,
+        .stbc_htltf2_en = true,
+        .ltf_merge_en = true,
+        .channel_filter_en = false,
+        .manu_scale = false,
+        .shift = 0,
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
+    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(&wifi_csi_rx_cb, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+
+    // Start scanning for WiFi signals
+    WiFi.scanNetworks(true, false, false, 300, WIFI_CHANNEL);
+}
+
+// Heart beat animation callback
+static void heart_beat_anim_cb(void * var, int32_t value) {
+    lv_obj_set_style_transform_zoom(heart_icon, value, 0);
+}
+
+// Smooth animation callbacks
+static void speed_anim_cb(void * var, int32_t value) {
+    vehicle.current_speed = value;
+    lv_label_set_text_fmt(speed_label, "%d", (int)value);
+
+    if (value < 50) {
+        lv_obj_set_style_arc_color(speed_arc, tesla_green, LV_PART_INDICATOR);
+    } else if (value < 90) {
+        lv_obj_set_style_arc_color(speed_arc, tesla_blue, LV_PART_INDICATOR);
+    } else if (value < 120) {
+        lv_obj_set_style_arc_color(speed_arc, tesla_orange, LV_PART_INDICATOR);
+    } else {
+        lv_obj_set_style_arc_color(speed_arc, tesla_red, LV_PART_INDICATOR);
+    }
+
+    lv_arc_set_value(speed_arc, value);
+}
+
+static void power_anim_cb(void * var, int32_t value) {
+    vehicle.current_power = value;
+
+    if (value < 0) {
+        lv_bar_set_value(regen_bar, -value, LV_ANIM_OFF);
+        lv_bar_set_value(power_bar, 0, LV_ANIM_OFF);
+        lv_label_set_text_fmt(power_label, "%d kW", value);
+        lv_obj_set_style_text_color(power_label, tesla_green, 0);
+    } else {
+        lv_bar_set_value(power_bar, value, LV_ANIM_OFF);
+        lv_bar_set_value(regen_bar, 0, LV_ANIM_OFF);
+        lv_label_set_text_fmt(power_label, "+%d kW", value);
+        lv_obj_set_style_text_color(power_label, tesla_orange, 0);
+    }
+}
+
+static void create_heart_rate_panel() {
+    // Heart rate panel (top center)
+    heart_panel = lv_obj_create(main_screen);
+    lv_obj_set_size(heart_panel, 240, 140);
+    lv_obj_align(heart_panel, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_set_style_bg_color(heart_panel, tesla_panel_bg, 0);
+    lv_obj_set_style_bg_opa(heart_panel, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(heart_panel, 2, 0);
+    lv_obj_set_style_border_color(heart_panel, heart_red, 0);
+    lv_obj_set_style_radius(heart_panel, 15, 0);
+    lv_obj_clear_flag(heart_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Heart icon
+    heart_icon = lv_label_create(heart_panel);
+    lv_label_set_text(heart_icon, "\xE2\x9D\xA4");
+    lv_obj_set_style_text_font(heart_icon, &lv_font_montserrat_30, 0);
+    lv_obj_set_style_text_color(heart_icon, heart_red, 0);
+    lv_obj_align(heart_icon, LV_ALIGN_LEFT_MID, 20, -20);
+
+    // Heart rate value
+    heart_rate_label = lv_label_create(heart_panel);
+    lv_label_set_text(heart_rate_label, "72");
+    lv_obj_set_style_text_font(heart_rate_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(heart_rate_label, tesla_text_primary, 0);
+    lv_obj_align(heart_rate_label, LV_ALIGN_CENTER, -10, -20);
+
+    // BPM label
+    lv_obj_t *bpm_label = lv_label_create(heart_panel);
+    lv_label_set_text(bpm_label, "BPM");
+    lv_obj_set_style_text_font(bpm_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(bpm_label, tesla_text_secondary, 0);
+    lv_obj_align(bpm_label, LV_ALIGN_CENTER, 50, -15);
+
+    // HRV label
+    hrv_label = lv_label_create(heart_panel);
+    lv_label_set_text(hrv_label, "HRV: 42ms");
+    lv_obj_set_style_text_font(hrv_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hrv_label, tesla_text_secondary, 0);
+    lv_obj_align(hrv_label, LV_ALIGN_BOTTOM_LEFT, 20, -10);
+
+    // Status label
+    heart_status_label = lv_label_create(heart_panel);
+    lv_label_set_text(heart_status_label, "WiFi CSI Active");
+    lv_obj_set_style_text_font(heart_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(heart_status_label, tesla_green, 0);
+    lv_obj_align(heart_status_label, LV_ALIGN_TOP_RIGHT, -10, 10);
+
+    // Mini heart rate chart
+    heart_rate_chart = lv_chart_create(heart_panel);
+    lv_obj_set_size(heart_rate_chart, 200, 40);
+    lv_obj_align(heart_rate_chart, LV_ALIGN_BOTTOM_MID, 0, -5);
+    lv_chart_set_type(heart_rate_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(heart_rate_chart, 50);
+    lv_chart_set_range(heart_rate_chart, LV_CHART_AXIS_PRIMARY_Y, 50, 120);
+    lv_obj_set_style_bg_opa(heart_rate_chart, LV_OPA_30, 0);
+    lv_obj_set_style_border_width(heart_rate_chart, 0, 0);
+    lv_obj_set_style_size(heart_rate_chart, 0, LV_PART_INDICATOR);
+
+    heart_rate_series = lv_chart_add_series(heart_rate_chart, heart_red,
+                                           LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_set_next_value(heart_rate_chart, heart_rate_series, 72);
+
+    // Initialize heart beat animation
+    lv_anim_init(&heart_beat_anim);
+    lv_anim_set_var(&heart_beat_anim, heart_icon);
+    lv_anim_set_exec_cb(&heart_beat_anim, heart_beat_anim_cb);
+    lv_anim_set_time(&heart_beat_anim, 300);
+    lv_anim_set_playback_time(&heart_beat_anim, 300);
+    lv_anim_set_repeat_count(&heart_beat_anim, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&heart_beat_anim, lv_anim_path_ease_in_out);
+}
+
+static void create_tesla_dashboard() {
+    // Main screen with dark background
+    main_screen = lv_scr_act();
+    lv_obj_set_style_bg_color(main_screen, tesla_dark_bg, 0);
+    lv_obj_clear_flag(main_screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Center panel for speed
+    lv_obj_t *speed_panel = lv_obj_create(main_screen);
+    lv_obj_set_size(speed_panel, 300, 300);
+    lv_obj_align(speed_panel, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_set_style_bg_color(speed_panel, tesla_panel_bg, 0);
+    lv_obj_set_style_bg_opa(speed_panel, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(speed_panel, 0, 0);
+    lv_obj_set_style_radius(speed_panel, 150, 0);
+    lv_obj_clear_flag(speed_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Speed arc
+    speed_arc = lv_arc_create(speed_panel);
+    lv_obj_set_size(speed_arc, 280, 280);
+    lv_obj_center(speed_arc);
+    lv_arc_set_rotation(speed_arc, 135);
+    lv_arc_set_bg_angles(speed_arc, 0, 270);
+    lv_arc_set_range(speed_arc, 0, 200);
+    lv_arc_set_value(speed_arc, 0);
+    lv_obj_set_style_arc_width(speed_arc, 15, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(speed_arc, 15, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(speed_arc, lv_color_hex(0x2a2a2a), LV_PART_MAIN);
+    lv_obj_set_style_arc_color(speed_arc, tesla_blue, LV_PART_INDICATOR);
+    lv_obj_remove_style(speed_arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(speed_arc, LV_OBJ_FLAG_CLICKABLE);
+
+    // Speed display
+    speed_label = lv_label_create(speed_panel);
+    lv_label_set_text(speed_label, "0");
+    lv_obj_set_style_text_font(speed_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(speed_label, tesla_text_primary, 0);
+    lv_obj_align(speed_label, LV_ALIGN_CENTER, 0, -20);
+
+    speed_unit_label = lv_label_create(speed_panel);
+    lv_label_set_text(speed_unit_label, "km/h");
+    lv_obj_set_style_text_font(speed_unit_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(speed_unit_label, tesla_text_secondary, 0);
+    lv_obj_align(speed_unit_label, LV_ALIGN_CENTER, 0, 20);
+
+    // Gear indicator
+    gear_label = lv_label_create(speed_panel);
+    lv_label_set_text(gear_label, "D");
+    lv_obj_set_style_text_font(gear_label, &lv_font_montserrat_30, 0);
+    lv_obj_set_style_text_color(gear_label, tesla_blue, 0);
+    lv_obj_align(gear_label, LV_ALIGN_CENTER, 0, 60);
+
+    // Power meter (left side)
+    lv_obj_t *power_panel = lv_obj_create(main_screen);
+    lv_obj_set_size(power_panel, 200, 400);
+    lv_obj_align(power_panel, LV_ALIGN_LEFT_MID, 40, 0);
+    lv_obj_set_style_bg_opa(power_panel, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(power_panel, 0, 0);
+    lv_obj_clear_flag(power_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Regeneration bar
+    regen_bar = lv_bar_create(power_panel);
+    lv_obj_set_size(regen_bar, 40, 150);
+    lv_obj_align(regen_bar, LV_ALIGN_CENTER, 0, 75);
+    lv_bar_set_range(regen_bar, 0, 60);
+    lv_bar_set_value(regen_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(regen_bar, lv_color_hex(0x1a1a1a), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(regen_bar, tesla_green, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(regen_bar, 5, 0);
+
+    // Power bar
+    power_bar = lv_bar_create(power_panel);
+    lv_obj_set_size(power_bar, 40, 150);
+    lv_obj_align(power_bar, LV_ALIGN_CENTER, 0, -75);
+    lv_bar_set_range(power_bar, 0, 250);
+    lv_bar_set_value(power_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(power_bar, lv_color_hex(0x1a1a1a), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(power_bar, tesla_orange, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(power_bar, 5, 0);
+
+    power_label = lv_label_create(power_panel);
+    lv_label_set_text(power_label, "0 kW");
+    lv_obj_set_style_text_font(power_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(power_label, tesla_text_secondary, 0);
+    lv_obj_align(power_label, LV_ALIGN_TOP_MID, 0, 10);
+
+    // Battery panel (right side)
+    lv_obj_t *battery_panel = lv_obj_create(main_screen);
+    lv_obj_set_size(battery_panel, 200, 400);
+    lv_obj_align(battery_panel, LV_ALIGN_RIGHT_MID, -40, 0);
+    lv_obj_set_style_bg_opa(battery_panel, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(battery_panel, 0, 0);
+    lv_obj_clear_flag(battery_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    battery_bar = lv_bar_create(battery_panel);
+    lv_obj_set_size(battery_bar, 150, 30);
+    lv_obj_align(battery_bar, LV_ALIGN_CENTER, 0, -50);
+    lv_bar_set_range(battery_bar, 0, 100);
+    lv_bar_set_value(battery_bar, vehicle.battery_percent, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(battery_bar, lv_color_hex(0x2a2a2a), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(battery_bar, tesla_green, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(battery_bar, 15, 0);
+
+    battery_percent_label = lv_label_create(battery_panel);
+    lv_label_set_text_fmt(battery_percent_label, "%d%%", vehicle.battery_percent);
+    lv_obj_set_style_text_font(battery_percent_label, &lv_font_montserrat_30, 0);
+    lv_obj_set_style_text_color(battery_percent_label, tesla_text_primary, 0);
+    lv_obj_align(battery_percent_label, LV_ALIGN_CENTER, 0, 20);
+
+    range_label = lv_label_create(battery_panel);
+    lv_label_set_text_fmt(range_label, "%d km", vehicle.range_km);
+    lv_obj_set_style_text_font(range_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(range_label, tesla_text_secondary, 0);
+    lv_obj_align(range_label, LV_ALIGN_CENTER, 0, 60);
+
+    // Turn signals
+    left_signal = lv_obj_create(main_screen);
+    lv_obj_set_size(left_signal, 60, 10);
+    lv_obj_align(left_signal, LV_ALIGN_TOP_MID, -80, 30);
+    lv_obj_set_style_bg_color(left_signal, lv_color_hex(0x2a2a2a), 0);
+    lv_obj_set_style_radius(left_signal, 5, 0);
+    lv_obj_set_style_border_width(left_signal, 0, 0);
+
+    right_signal = lv_obj_create(main_screen);
+    lv_obj_set_size(right_signal, 60, 10);
+    lv_obj_align(right_signal, LV_ALIGN_TOP_MID, 80, 30);
+    lv_obj_set_style_bg_color(right_signal, lv_color_hex(0x2a2a2a), 0);
+    lv_obj_set_style_radius(right_signal, 5, 0);
+    lv_obj_set_style_border_width(right_signal, 0, 0);
+
+    autopilot_indicator = lv_obj_create(main_screen);
+    lv_obj_set_size(autopilot_indicator, 100, 10);
+    lv_obj_align(autopilot_indicator, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(autopilot_indicator, lv_color_hex(0x2a2a2a), 0);
+    lv_obj_set_style_radius(autopilot_indicator, 5, 0);
+    lv_obj_set_style_border_width(autopilot_indicator, 0, 0);
+
+    temp_label = lv_label_create(main_screen);
+    lv_label_set_text_fmt(temp_label, "%d°C", vehicle.outside_temp);
+    lv_obj_set_style_text_font(temp_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(temp_label, tesla_text_secondary, 0);
+    lv_obj_align(temp_label, LV_ALIGN_BOTTOM_LEFT, 40, -20);
+
+    time_label = lv_label_create(main_screen);
+    lv_label_set_text(time_label, "14:35");
+    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(time_label, tesla_text_secondary, 0);
+    lv_obj_align(time_label, LV_ALIGN_BOTTOM_RIGHT, -40, -20);
+
+    // Add heart rate panel
+    create_heart_rate_panel();
+
+    // Initialize animations
+    lv_anim_init(&speed_anim);
+    lv_anim_set_var(&speed_anim, &vehicle);
+    lv_anim_set_exec_cb(&speed_anim, speed_anim_cb);
+    lv_anim_set_time(&speed_anim, 500);
+    lv_anim_set_path_cb(&speed_anim, lv_anim_path_ease_in_out);
+
+    lv_anim_init(&power_anim);
+    lv_anim_set_var(&power_anim, &vehicle);
+    lv_anim_set_exec_cb(&power_anim, power_anim_cb);
+    lv_anim_set_time(&power_anim, 300);
+    lv_anim_set_path_cb(&power_anim, lv_anim_path_ease_in_out);
+}
+
+// Update heart rate from CSI data
+static void update_heart_rate(lv_timer_t * timer) {
+    // Process CSI data to extract heart rate
+    float new_hr = extract_heart_rate_from_csi();
+
+    // Simulate realistic heart rate variation
+    static float hr_trend = 72;
+    static int stress_level = 0;
+
+    // Simulate stress during high speed driving
+    if (vehicle.current_speed > 120) {
+        stress_level = min(10, stress_level + 1);
+    } else {
+        stress_level = max(0, stress_level - 1);
+    }
+
+    // Add some natural variation
+    hr_trend = hr_trend * 0.95 + (new_hr + stress_level * 2 + random(-3, 3)) * 0.05;
+
+    // Clamp to realistic range
+    if (hr_trend < 50) hr_trend = 50;
+    if (hr_trend > 150) hr_trend = 150;
+
+    heart_state.current_heart_rate = hr_trend;
+
+    // Update HRV (higher when relaxed, lower when stressed)
+    heart_state.heart_rate_variability = 60 - stress_level * 3 + random(-5, 5);
+
+    // Update display
+    lv_label_set_text_fmt(heart_rate_label, "%d", (int)heart_state.current_heart_rate);
+    lv_label_set_text_fmt(hrv_label, "HRV: %dms", (int)heart_state.heart_rate_variability);
+
+    // Update chart
+    lv_chart_set_next_value(heart_rate_chart, heart_rate_series,
+                           (int)heart_state.current_heart_rate);
+
+    // Trigger heartbeat animation based on actual rate
+    unsigned long beat_interval = 60000 / heart_state.current_heart_rate;
+    lv_anim_set_values(&heart_beat_anim, 256, 280);
+    lv_anim_set_time(&heart_beat_anim, beat_interval / 4);
+    lv_anim_set_playback_time(&heart_beat_anim, beat_interval / 4);
+
+    // Update status based on signal quality
+    if (heart_state.signal_quality > 0.8) {
+        lv_label_set_text(heart_status_label, "Signal: Excellent");
+        lv_obj_set_style_text_color(heart_status_label, tesla_green, 0);
+    } else if (heart_state.signal_quality > 0.5) {
+        lv_label_set_text(heart_status_label, "Signal: Good");
+        lv_obj_set_style_text_color(heart_status_label, tesla_blue, 0);
+    } else {
+        lv_label_set_text(heart_status_label, "Signal: Weak");
+        lv_obj_set_style_text_color(heart_status_label, tesla_orange, 0);
+    }
+
+    // Color code heart rate
+    if (heart_state.current_heart_rate < 60) {
+        lv_obj_set_style_text_color(heart_rate_label, tesla_blue, 0);
+    } else if (heart_state.current_heart_rate < 100) {
+        lv_obj_set_style_text_color(heart_rate_label, tesla_green, 0);
+    } else if (heart_state.current_heart_rate < 120) {
+        lv_obj_set_style_text_color(heart_rate_label, tesla_orange, 0);
+    } else {
+        lv_obj_set_style_text_color(heart_rate_label, tesla_red, 0);
+    }
+}
+
+static void update_dashboard_smooth(lv_timer_t * timer) {
+    static int demo_phase = 0;
+    static int signal_blink = 0;
+
+    demo_phase++;
+
+    // Demo driving simulation
+    if (demo_phase < 100) {
+        vehicle.target_speed = min(150.0f, vehicle.target_speed + 2);
+        vehicle.target_power = min(200.0f, vehicle.target_power + 4);
+    } else if (demo_phase < 200) {
+        vehicle.target_speed = 120;
+        vehicle.target_power = 40;
+        vehicle.autopilot_on = true;
+    } else if (demo_phase < 250) {
+        vehicle.target_speed = max(60.0f, vehicle.target_speed - 2);
+        vehicle.target_power = max(-50.0f, vehicle.target_power - 3);
+        vehicle.autopilot_on = false;
+    } else if (demo_phase < 350) {
+        vehicle.target_speed = 50;
+        vehicle.target_power = 20;
+    } else if (demo_phase < 400) {
+        vehicle.target_speed = max(0.0f, vehicle.target_speed - 2);
+        vehicle.target_power = max(-30.0f, vehicle.target_power - 2);
+    } else {
+        demo_phase = 0;
+        vehicle.target_speed = 0;
+        vehicle.target_power = 0;
+    }
+
+    // Smooth transitions
+    if (abs(vehicle.current_speed - vehicle.target_speed) > 0.5) {
+        lv_anim_set_values(&speed_anim, vehicle.current_speed, vehicle.target_speed);
+        lv_anim_start(&speed_anim);
+    }
+
+    if (abs(vehicle.current_power - vehicle.target_power) > 1) {
+        lv_anim_set_values(&power_anim, vehicle.current_power, vehicle.target_power);
+        lv_anim_start(&power_anim);
+    }
+
+    // Update turn signals
+    signal_blink++;
+    if (demo_phase % 150 < 50) {
+        vehicle.left_turn_on = (signal_blink % 20) < 10;
+        vehicle.right_turn_on = false;
+    } else if (demo_phase % 150 < 100) {
+        vehicle.right_turn_on = (signal_blink % 20) < 10;
+        vehicle.left_turn_on = false;
+    } else {
+        vehicle.left_turn_on = false;
+        vehicle.right_turn_on = false;
+    }
+
+    lv_obj_set_style_bg_color(left_signal,
+        vehicle.left_turn_on ? tesla_orange : lv_color_hex(0x2a2a2a), 0);
+    lv_obj_set_style_bg_color(right_signal,
+        vehicle.right_turn_on ? tesla_orange : lv_color_hex(0x2a2a2a), 0);
+
+    lv_obj_set_style_bg_color(autopilot_indicator,
+        vehicle.autopilot_on ? tesla_blue : lv_color_hex(0x2a2a2a), 0);
+
+    // Update battery
+    if (vehicle.current_power > 0 && demo_phase % 50 == 0) {
+        vehicle.battery_percent = max(20, vehicle.battery_percent - 1);
+        vehicle.range_km = vehicle.battery_percent * 5;
+    } else if (vehicle.current_power < 0 && demo_phase % 100 == 0) {
+        vehicle.battery_percent = min(85, vehicle.battery_percent + 1);
+        vehicle.range_km = vehicle.battery_percent * 5;
+    }
+
+    lv_bar_set_value(battery_bar, vehicle.battery_percent, LV_ANIM_ON);
+    lv_label_set_text_fmt(battery_percent_label, "%d%%", vehicle.battery_percent);
+    lv_label_set_text_fmt(range_label, "%d km", vehicle.range_km);
+
+    if (vehicle.battery_percent > 50) {
+        lv_obj_set_style_bg_color(battery_bar, tesla_green, LV_PART_INDICATOR);
+    } else if (vehicle.battery_percent > 20) {
+        lv_obj_set_style_bg_color(battery_bar, tesla_orange, LV_PART_INDICATOR);
+    } else {
+        lv_obj_set_style_bg_color(battery_bar, tesla_red, LV_PART_INDICATOR);
+    }
+
+    // Update time
+    static int minutes = 35;
+    static int hours = 14;
+    if (demo_phase % 120 == 0) {
+        minutes++;
+        if (minutes >= 60) {
+            minutes = 0;
+            hours++;
+            if (hours >= 24) hours = 0;
+        }
+        lv_label_set_text_fmt(time_label, "%02d:%02d", hours, minutes);
+    }
+
+    // Start heartbeat animation if not running
+    if (!lv_anim_get(heart_icon, NULL)) {
+        lv_anim_start(&heart_beat_anim);
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("Tesla Dashboard with Pulse-Fi Starting...");
+
+    // Initialize board
+    Serial.println("Initializing display board");
+    board = new Board();
+    board->init();
+
+    #if LVGL_PORT_AVOID_TEARING_MODE
+    auto lcd = board->getLCD();
+    lcd->configFrameBufferNumber(2);
+    #endif
+
+    assert(board->begin());
+
+    // Initialize LVGL
+    Serial.println("Initializing LVGL");
+    lvgl_port_init(board->getLCD(), board->getTouch());
+
+    // Initialize WiFi CSI for heart rate monitoring
+    Serial.println("Initializing WiFi CSI for Pulse-Fi");
+    setup_wifi_csi();
+
+    // Create Tesla dashboard with heart rate monitor
+    lvgl_port_lock(-1);
+    create_tesla_dashboard();
+
+    // Create timers
+    update_timer = lv_timer_create(update_dashboard_smooth, 16, NULL);
+    csi_timer = lv_timer_create(update_heart_rate, 500, NULL);  // Update heart rate every 500ms
+
+    lvgl_port_unlock();
+
+    Serial.println("Tesla Dashboard with Pulse-Fi Ready!");
+    Serial.println("Heart rate monitoring via WiFi CSI active");
+}
+
+void loop() {
+    // Generate synthetic CSI data for demo
+    // In real implementation, this would come from WiFi CSI callback
+    for (int i = 0; i < 10; i++) {
+        float synthetic_amplitude = 100 + sin(millis() * 0.001 * 1.2) * 20 + random(-5, 5);
+        csi_amplitude_buffer[csi_buffer_index] = synthetic_amplitude;
+        csi_buffer_index = (csi_buffer_index + 1) % HEART_RATE_BUFFER_SIZE;
+    }
+
+    delay(100);
+}

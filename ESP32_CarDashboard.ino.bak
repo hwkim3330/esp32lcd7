@@ -1,0 +1,392 @@
+#include <Arduino.h>
+#include <esp_display_panel.hpp>
+#include <lvgl.h>
+#include "lvgl_v8_port.h"
+
+static lv_obj_t *scr;
+static lv_obj_t *speed_label;
+static lv_obj_t *rpm_label;
+static lv_obj_t *speed_meter;
+static lv_obj_t *rpm_meter;
+static lv_obj_t *fuel_meter;
+static lv_obj_t *temp_meter;
+static lv_obj_t *gear_label;
+static lv_obj_t *turn_left_img;
+static lv_obj_t *turn_right_img;
+static lv_obj_t *high_beam_img;
+static lv_obj_t *battery_bar;
+static lv_obj_t *battery_label;
+static lv_obj_t *time_label;
+static lv_obj_t *odo_label;
+static lv_obj_t *trip_label;
+
+using namespace esp_panel::drivers;
+using namespace esp_panel::board;
+
+Board *board = NULL;
+
+// Simulated values
+float current_speed = 0;
+float target_speed = 0;
+float current_rpm = 0;
+float target_rpm = 0;
+int gear = 1;
+int fuel_level = 75;
+int engine_temp = 85;
+int battery_voltage = 12;
+float odometer = 123456.7;
+float trip = 234.5;
+bool left_turn = false;
+bool right_turn = false;
+bool high_beam = false;
+
+void create_dashboard_ui() {
+    scr = lv_scr_act();
+
+    // Set background to black
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+
+    // Create speedometer (center-left)
+    speed_meter = lv_meter_create(scr);
+    lv_obj_set_size(speed_meter, 280, 280);
+    lv_obj_align(speed_meter, LV_ALIGN_LEFT_MID, 100, 0);
+
+    lv_meter_scale_t * scale = lv_meter_add_scale(speed_meter);
+    lv_meter_set_scale_ticks(speed_meter, scale, 41, 2, 10, lv_palette_main(LV_PALETTE_GREY));
+    lv_meter_set_scale_major_ticks(speed_meter, scale, 8, 4, 15, lv_color_white(), 10);
+    lv_meter_set_scale_range(speed_meter, scale, 0, 200, 300, 135);
+
+    // Add needle for speedometer
+    lv_meter_indicator_t * indic_speed = lv_meter_add_needle_line(speed_meter, scale, 4, lv_palette_main(LV_PALETTE_CYAN), -10);
+    lv_meter_set_indicator_value(speed_meter, indic_speed, 0);
+
+    // Speed label
+    speed_label = lv_label_create(speed_meter);
+    lv_label_set_text(speed_label, "0");
+    lv_obj_set_style_text_font(speed_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(speed_label, lv_color_white(), 0);
+    lv_obj_align(speed_label, LV_ALIGN_CENTER, 0, -20);
+
+    lv_obj_t *speed_unit = lv_label_create(speed_meter);
+    lv_label_set_text(speed_unit, "km/h");
+    lv_obj_set_style_text_font(speed_unit, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(speed_unit, lv_palette_main(LV_PALETTE_GREY), 0);
+    lv_obj_align(speed_unit, LV_ALIGN_CENTER, 0, 30);
+
+    // Create RPM meter (center-right)
+    rpm_meter = lv_meter_create(scr);
+    lv_obj_set_size(rpm_meter, 280, 280);
+    lv_obj_align(rpm_meter, LV_ALIGN_RIGHT_MID, -100, 0);
+
+    scale = lv_meter_add_scale(rpm_meter);
+    lv_meter_set_scale_ticks(rpm_meter, scale, 41, 2, 10, lv_palette_main(LV_PALETTE_GREY));
+    lv_meter_set_scale_major_ticks(rpm_meter, scale, 8, 4, 15, lv_color_white(), 10);
+    lv_meter_set_scale_range(rpm_meter, scale, 0, 8000, 300, 135);
+
+    // Add red zone indicator
+    lv_meter_indicator_t * indic_redzone = lv_meter_add_arc(rpm_meter, scale, 10, lv_palette_main(LV_PALETTE_RED), 0);
+    lv_meter_set_indicator_start_value(rpm_meter, indic_redzone, 6500);
+    lv_meter_set_indicator_end_value(rpm_meter, indic_redzone, 8000);
+
+    // Add needle for RPM
+    lv_meter_indicator_t * indic_rpm = lv_meter_add_needle_line(rpm_meter, scale, 4, lv_palette_main(LV_PALETTE_ORANGE), -10);
+    lv_meter_set_indicator_value(rpm_meter, indic_rpm, 0);
+
+    // RPM label
+    rpm_label = lv_label_create(rpm_meter);
+    lv_label_set_text(rpm_label, "0");
+    lv_obj_set_style_text_font(rpm_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(rpm_label, lv_color_white(), 0);
+    lv_obj_align(rpm_label, LV_ALIGN_CENTER, 0, -20);
+
+    lv_obj_t *rpm_unit = lv_label_create(rpm_meter);
+    lv_label_set_text(rpm_unit, "RPM");
+    lv_obj_set_style_text_font(rpm_unit, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(rpm_unit, lv_palette_main(LV_PALETTE_GREY), 0);
+    lv_obj_align(rpm_unit, LV_ALIGN_CENTER, 0, 30);
+
+    // Gear indicator (center)
+    lv_obj_t *gear_bg = lv_obj_create(scr);
+    lv_obj_set_size(gear_bg, 80, 100);
+    lv_obj_align(gear_bg, LV_ALIGN_CENTER, 0, -50);
+    lv_obj_set_style_bg_color(gear_bg, lv_color_hex(0x1a1a1a), 0);
+    lv_obj_set_style_border_color(gear_bg, lv_palette_main(LV_PALETTE_CYAN), 0);
+    lv_obj_set_style_border_width(gear_bg, 2, 0);
+
+    gear_label = lv_label_create(gear_bg);
+    lv_label_set_text(gear_label, "N");
+    lv_obj_set_style_text_font(gear_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(gear_label, lv_palette_main(LV_PALETTE_CYAN), 0);
+    lv_obj_align(gear_label, LV_ALIGN_CENTER, 0, 0);
+
+    // Fuel gauge (bottom-left)
+    lv_obj_t *fuel_container = lv_obj_create(scr);
+    lv_obj_set_size(fuel_container, 150, 80);
+    lv_obj_align(fuel_container, LV_ALIGN_BOTTOM_LEFT, 20, -20);
+    lv_obj_set_style_bg_color(fuel_container, lv_color_hex(0x1a1a1a), 0);
+    lv_obj_set_style_border_width(fuel_container, 0, 0);
+
+    lv_obj_t *fuel_icon = lv_label_create(fuel_container);
+    lv_label_set_text(fuel_icon, LV_SYMBOL_BATTERY_FULL);
+    lv_obj_set_style_text_font(fuel_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(fuel_icon, lv_palette_main(LV_PALETTE_GREEN), 0);
+    lv_obj_align(fuel_icon, LV_ALIGN_LEFT_MID, 10, 0);
+
+    fuel_meter = lv_bar_create(fuel_container);
+    lv_obj_set_size(fuel_meter, 80, 20);
+    lv_obj_align(fuel_meter, LV_ALIGN_CENTER, 20, 0);
+    lv_bar_set_range(fuel_meter, 0, 100);
+    lv_bar_set_value(fuel_meter, fuel_level, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(fuel_meter, lv_palette_main(LV_PALETTE_GREY), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(fuel_meter, lv_palette_main(LV_PALETTE_GREEN), LV_PART_INDICATOR);
+
+    // Temperature gauge (bottom-right)
+    lv_obj_t *temp_container = lv_obj_create(scr);
+    lv_obj_set_size(temp_container, 150, 80);
+    lv_obj_align(temp_container, LV_ALIGN_BOTTOM_RIGHT, -20, -20);
+    lv_obj_set_style_bg_color(temp_container, lv_color_hex(0x1a1a1a), 0);
+    lv_obj_set_style_border_width(temp_container, 0, 0);
+
+    lv_obj_t *temp_icon = lv_label_create(temp_container);
+    lv_label_set_text(temp_icon, LV_SYMBOL_SETTINGS);
+    lv_obj_set_style_text_font(temp_icon, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(temp_icon, lv_palette_main(LV_PALETTE_BLUE), 0);
+    lv_obj_align(temp_icon, LV_ALIGN_LEFT_MID, 10, 0);
+
+    temp_meter = lv_bar_create(temp_container);
+    lv_obj_set_size(temp_meter, 80, 20);
+    lv_obj_align(temp_meter, LV_ALIGN_CENTER, 20, 0);
+    lv_bar_set_range(temp_meter, 0, 120);
+    lv_bar_set_value(temp_meter, engine_temp, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(temp_meter, lv_palette_main(LV_PALETTE_GREY), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(temp_meter, lv_palette_main(LV_PALETTE_BLUE), LV_PART_INDICATOR);
+
+    // Turn signals (top)
+    turn_left_img = lv_label_create(scr);
+    lv_label_set_text(turn_left_img, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(turn_left_img, &lv_font_montserrat_30, 0);
+    lv_obj_set_style_text_color(turn_left_img, lv_palette_main(LV_PALETTE_GREY), 0);
+    lv_obj_align(turn_left_img, LV_ALIGN_TOP_MID, -50, 20);
+
+    turn_right_img = lv_label_create(scr);
+    lv_label_set_text(turn_right_img, LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_font(turn_right_img, &lv_font_montserrat_30, 0);
+    lv_obj_set_style_text_color(turn_right_img, lv_palette_main(LV_PALETTE_GREY), 0);
+    lv_obj_align(turn_right_img, LV_ALIGN_TOP_MID, 50, 20);
+
+    // High beam indicator
+    high_beam_img = lv_label_create(scr);
+    lv_label_set_text(high_beam_img, LV_SYMBOL_EYE_OPEN);
+    lv_obj_set_style_text_font(high_beam_img, &lv_font_montserrat_30, 0);
+    lv_obj_set_style_text_color(high_beam_img, lv_palette_main(LV_PALETTE_GREY), 0);
+    lv_obj_align(high_beam_img, LV_ALIGN_TOP_MID, 0, 20);
+
+    // Battery voltage
+    battery_label = lv_label_create(scr);
+    lv_label_set_text(battery_label, "12.6V");
+    lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(battery_label, lv_palette_main(LV_PALETTE_GREEN), 0);
+    lv_obj_align(battery_label, LV_ALIGN_TOP_LEFT, 20, 20);
+
+    // Time display
+    time_label = lv_label_create(scr);
+    lv_label_set_text(time_label, "14:35");
+    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(time_label, lv_color_white(), 0);
+    lv_obj_align(time_label, LV_ALIGN_TOP_RIGHT, -20, 20);
+
+    // Odometer
+    odo_label = lv_label_create(scr);
+    lv_label_set_text(odo_label, "ODO: 123456.7 km");
+    lv_obj_set_style_text_font(odo_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(odo_label, lv_palette_main(LV_PALETTE_GREY), 0);
+    lv_obj_align(odo_label, LV_ALIGN_BOTTOM_MID, -60, -10);
+
+    // Trip meter
+    trip_label = lv_label_create(scr);
+    lv_label_set_text(trip_label, "TRIP: 234.5 km");
+    lv_obj_set_style_text_font(trip_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(trip_label, lv_palette_main(LV_PALETTE_GREY), 0);
+    lv_obj_align(trip_label, LV_ALIGN_BOTTOM_MID, 60, -10);
+}
+
+void update_dashboard() {
+    // Smooth transitions for speed
+    if (current_speed < target_speed) {
+        current_speed += 2;
+        if (current_speed > target_speed) current_speed = target_speed;
+    } else if (current_speed > target_speed) {
+        current_speed -= 2;
+        if (current_speed < target_speed) current_speed = target_speed;
+    }
+
+    // Smooth transitions for RPM
+    if (current_rpm < target_rpm) {
+        current_rpm += 100;
+        if (current_rpm > target_rpm) current_rpm = target_rpm;
+    } else if (current_rpm > target_rpm) {
+        current_rpm -= 100;
+        if (current_rpm < target_rpm) current_rpm = target_rpm;
+    }
+
+    // Update speed
+    lv_label_set_text_fmt(speed_label, "%d", (int)current_speed);
+    lv_meter_indicator_t * indic = (lv_meter_indicator_t *)lv_obj_get_child(speed_meter, 0);
+    lv_meter_set_indicator_value(speed_meter, indic, current_speed);
+
+    // Update RPM
+    lv_label_set_text_fmt(rpm_label, "%d", (int)current_rpm);
+    indic = (lv_meter_indicator_t *)lv_obj_get_child(rpm_meter, 0);
+    lv_meter_set_indicator_value(rpm_meter, indic, current_rpm);
+
+    // Update gear
+    const char* gear_text[] = {"P", "R", "N", "D", "1", "2", "3", "4", "5", "6"};
+    if (gear >= 0 && gear < 10) {
+        lv_label_set_text(gear_label, gear_text[gear]);
+    }
+
+    // Update fuel
+    lv_bar_set_value(fuel_meter, fuel_level, LV_ANIM_ON);
+    if (fuel_level < 20) {
+        lv_obj_set_style_bg_color(fuel_meter, lv_palette_main(LV_PALETTE_RED), LV_PART_INDICATOR);
+    } else if (fuel_level < 40) {
+        lv_obj_set_style_bg_color(fuel_meter, lv_palette_main(LV_PALETTE_YELLOW), LV_PART_INDICATOR);
+    } else {
+        lv_obj_set_style_bg_color(fuel_meter, lv_palette_main(LV_PALETTE_GREEN), LV_PART_INDICATOR);
+    }
+
+    // Update temperature
+    lv_bar_set_value(temp_meter, engine_temp, LV_ANIM_ON);
+    if (engine_temp > 100) {
+        lv_obj_set_style_bg_color(temp_meter, lv_palette_main(LV_PALETTE_RED), LV_PART_INDICATOR);
+    } else if (engine_temp < 60) {
+        lv_obj_set_style_bg_color(temp_meter, lv_palette_main(LV_PALETTE_BLUE), LV_PART_INDICATOR);
+    } else {
+        lv_obj_set_style_bg_color(temp_meter, lv_palette_main(LV_PALETTE_GREEN), LV_PART_INDICATOR);
+    }
+
+    // Update turn signals
+    lv_obj_set_style_text_color(turn_left_img,
+        left_turn ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_GREY), 0);
+    lv_obj_set_style_text_color(turn_right_img,
+        right_turn ? lv_palette_main(LV_PALETTE_GREEN) : lv_palette_main(LV_PALETTE_GREY), 0);
+
+    // Update high beam
+    lv_obj_set_style_text_color(high_beam_img,
+        high_beam ? lv_palette_main(LV_PALETTE_BLUE) : lv_palette_main(LV_PALETTE_GREY), 0);
+
+    // Update battery voltage
+    float voltage = 11.5 + (battery_voltage / 10.0);
+    lv_label_set_text_fmt(battery_label, "%.1fV", voltage);
+    if (voltage < 11.8) {
+        lv_obj_set_style_text_color(battery_label, lv_palette_main(LV_PALETTE_RED), 0);
+    } else if (voltage < 12.2) {
+        lv_obj_set_style_text_color(battery_label, lv_palette_main(LV_PALETTE_YELLOW), 0);
+    } else {
+        lv_obj_set_style_text_color(battery_label, lv_palette_main(LV_PALETTE_GREEN), 0);
+    }
+
+    // Update odometer and trip
+    lv_label_set_text_fmt(odo_label, "ODO: %.1f km", odometer);
+    lv_label_set_text_fmt(trip_label, "TRIP: %.1f km", trip);
+}
+
+void simulate_driving() {
+    static unsigned long last_update = 0;
+    static int demo_state = 0;
+
+    if (millis() - last_update > 100) {
+        last_update = millis();
+
+        // Demo sequence
+        demo_state++;
+        if (demo_state < 50) {
+            // Accelerate
+            target_speed = min(180.0f, target_speed + 3);
+            target_rpm = min(6000.0f, target_rpm + 100);
+            gear = min(6, 1 + (int)(target_speed / 30));
+        } else if (demo_state < 100) {
+            // Cruise
+            target_speed = 120;
+            target_rpm = 3500;
+            gear = 5;
+        } else if (demo_state < 150) {
+            // Decelerate
+            target_speed = max(0.0f, target_speed - 2);
+            target_rpm = max(800.0f, target_rpm - 80);
+            gear = max(1, 1 + (int)(target_speed / 30));
+        } else if (demo_state < 200) {
+            // Idle
+            target_speed = 0;
+            target_rpm = 800;
+            gear = 2; // N
+        } else {
+            demo_state = 0;
+        }
+
+        // Random turn signals
+        if (demo_state % 30 == 0) {
+            left_turn = random(2);
+            right_turn = !left_turn && random(2);
+        }
+
+        // High beam toggle
+        if (demo_state % 50 == 0) {
+            high_beam = !high_beam;
+        }
+
+        // Simulate fuel consumption
+        if (demo_state % 100 == 0) {
+            fuel_level = max(10, fuel_level - 1);
+        }
+
+        // Simulate temperature changes
+        if (target_speed > 100) {
+            engine_temp = min(95, engine_temp + 1);
+        } else if (target_speed < 20) {
+            engine_temp = max(75, engine_temp - 1);
+        }
+
+        // Update odometer
+        odometer += target_speed * 0.0001;
+        trip += target_speed * 0.0001;
+
+        // Battery voltage fluctuation
+        battery_voltage = 12 + random(-2, 3);
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    Serial.println("Initializing ESP32 Car Dashboard");
+
+    // Initialize board
+    Serial.println("Initializing board");
+    board = new Board();
+    board->init();
+    board->begin();
+
+    // Initialize LVGL
+    Serial.println("Initializing LVGL");
+    lvgl_port_init(board->getLCD(), board->getTouch());
+
+    // Create dashboard UI
+    lvgl_port_lock(-1);
+    create_dashboard_ui();
+    lvgl_port_unlock();
+
+    Serial.println("Car Dashboard Ready!");
+}
+
+void loop() {
+    // Simulate driving data
+    simulate_driving();
+
+    // Update dashboard display
+    lvgl_port_lock(-1);
+    update_dashboard();
+    lvgl_port_unlock();
+
+    delay(50); // Update at 20 FPS
+}
