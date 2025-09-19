@@ -649,7 +649,7 @@ void create_radar_ui() {
     // Info text
     lv_obj_t *info_label = lv_label_create(settings_panel);
     lv_label_set_text(info_label, "Touch to adjust settings");
-    lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(info_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(info_label, LV_COLOR_MAKE(0x80, 0x80, 0x80), 0);
     lv_obj_align(info_label, LV_ALIGN_BOTTOM_MID, 0, -10);
 
